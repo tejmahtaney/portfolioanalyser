@@ -19,20 +19,13 @@ pip install -e ".[dev]"
 streamlit run streamlit_app.py
 ```
 
-## Weights and what recomputes
+## Weights
 
-Weights are typed as decimals (for example 0.5, 12.75 or 0.001), stored as float64, and divided by their sum before any calculation. Rounding to 2 decimal places happens for display only, with the largest remainder method so each displayed column sums to 100.00. A typed total of 0 shows a message and skips the weight-dependent calculations.
+Type weights as decimals, for example 0.5 or 12.75. The app divides them by their sum before any calculation. Displayed weights are rounded to 2 decimal places so each column sums to 100.00. A typed total of 0 skips the weight-dependent statistics.
 
-| Changes | Recomputes |
-| --- | --- |
-| A typed weight that keeps the same tickers held | Volatility, beta, risk contributions, VaR, drawdown, and the user's point on the frontier. Nothing is downloaded and nothing is estimated. |
-| A typed weight that moves a ticker between zero and positive | The same, plus the common window, covariance, expected returns and betas of the held tickers. Cached per sorted held set and settings, and built from the prices already loaded, so nothing is downloaded. |
-| Tickers or estimation settings | Prices (only tickers missing from the disk cache), covariance, expected returns for all selected tickers, and for the held tickers |
-| Press **Run optimisation**, or open Frontier, Recommendations or Backtest for the first time | Optimiser, frontier and backtest, kept in the session per tickers and settings |
+The Portfolio tab and the Current rows of the Excel export use only assets with a weight above 0, over their own common history. An asset at weight 0 does not change these numbers. The Frontier, Recommendations and Backtest tabs use all selected assets over their shared history, so their Current figures can differ from the Portfolio tab.
 
-A ticker is held when its normalised weight is above 0. The Portfolio tab (metrics and table) and the Current sheets of the Excel export use estimates built from the held tickers alone: their own common window, covariance and expected returns, with the same sidebar settings. Adding a ticker at weight 0 therefore changes none of those numbers, and one held asset is enough. Zero-weight rows stay in the Portfolio table with "–" in the estimate columns. The Portfolio tab states the weeks and date range used.
-
-The optimiser, frontier, recommendations and backtest use the shared estimates over all selected tickers, whatever the weights. In the Recommendations tab the Current statistics row, and the Your portfolio point on the frontier, are computed on those shared estimates, so they can differ from the Portfolio tab when a selected ticker has zero weight or a shorter history.
+The optimiser, frontier and backtest run when you press **Run optimisation** or first open one of those tabs. Editing weights does not rerun them.
 
 ## Excel import and export
 
@@ -69,8 +62,8 @@ Tests use synthetic data and need no network access.
 | `excel_io.py` | Excel export and import |
 | `sheet_builder.py` | Formula-driven workbook generator |
 | `charts.py` | Plotly figures |
-| `ui.py` | Streamlit interface. Estimates are cached on tickers and settings; the weight table and tabs run in one fragment |
+| `ui.py` | Streamlit interface |
 
-Prices are cached in `.cache/` (override with `PORTFOLIO_RISK_CACHE`) and refreshed after 24 hours. Each file records whether its currency came from Yahoo metadata or from the `.SI` suffix guess; guessed currencies are looked up again on every load. Prices are forward-filled across holiday gaps only up to a series' last date, so a ticker whose data ends early shortens the common window instead of showing flat prices.
+Prices are converted to USD and cached in `.cache/` for 24 hours. Set `PORTFOLIO_RISK_CACHE` to use another folder.
 
 Results are historical and are not financial advice.
