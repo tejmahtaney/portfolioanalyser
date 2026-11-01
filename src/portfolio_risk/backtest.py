@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from . import analytics, optimiser
-from .config import BACKTEST_HOLD_WEEKS, BACKTEST_TRAIN_WEEKS, PERIODS_PER_YEAR
+from .config import BACKTEST_HOLD_WEEKS, BACKTEST_TRAIN_WEEKS, EWMA_HALF_LIFE_WEEKS, PERIODS_PER_YEAR
 
 STRATEGIES = ["Your weights", "Equal weight", "Minimum variance", "Maximum Sharpe", "Risk parity"]
 
@@ -20,6 +20,7 @@ def run_backtest(
     shrinkage: float,
     train: int = BACKTEST_TRAIN_WEEKS,
     hold: int = BACKTEST_HOLD_WEEKS,
+    half_life: float = EWMA_HALF_LIFE_WEEKS,
 ) -> pd.DataFrame:
     """Out-of-sample weekly returns per strategy, with constant weights within each holding block.
 
@@ -34,7 +35,7 @@ def run_backtest(
     for start in range(train, len(returns), hold):
         fit = returns.iloc[start - train : start]
         test = returns.iloc[start : start + hold]
-        cov = analytics.annual_covariance(fit, cov_method)
+        cov = analytics.annual_covariance(fit, cov_method, half_life)
         mu = analytics.expected_returns(fit, return_method, shrinkage)
         try:
             weights = {

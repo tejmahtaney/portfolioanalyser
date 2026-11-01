@@ -77,3 +77,30 @@ def test_max_drawdown_and_var():
     wealth = [1.1, 0.88, 0.924, 0.8316]
     assert analytics.max_drawdown(r) == pytest.approx(0.8316 / 1.1 - 1)
     assert analytics.historical_var(pd.Series(np.arange(-50, 50) / 100)) > 0
+
+
+def test_ewma_with_a_very_long_half_life_matches_ledoit_wolf(returns):
+    r = returns[["A", "B", "C", "D"]]
+    ewma = analytics.annual_covariance(r, "ewma", half_life=1e9)
+    lw = analytics.annual_covariance(r, "ledoit_wolf")
+    np.testing.assert_allclose(ewma.to_numpy(), lw.to_numpy(), atol=1e-6)
+
+
+def test_ewma_weights_recent_weeks_more_than_ledoit_wolf():
+    rng = np.random.default_rng(3)
+    n = 260
+    scale = np.where(np.arange(n) >= n - 52, 0.04, 0.02)
+    r = pd.DataFrame(rng.normal(0, 1, (n, 3)) * scale[:, None], columns=["A", "B", "C"])
+    ewma = analytics.annual_covariance(r, "ewma", half_life=52)
+    lw = analytics.annual_covariance(r, "ledoit_wolf")
+    assert ewma.loc["A", "A"] > lw.loc["A", "A"]
+
+
+def test_effective_weeks():
+    assert 149 < analytics.effective_weeks(10_000, 52) < 151
+    assert analytics.effective_weeks(100, 1e12) == pytest.approx(100)
+
+
+def test_ewma_rejects_a_non_positive_half_life(returns):
+    with pytest.raises(ValueError):
+        analytics.annual_covariance(returns[["A", "B"]], "ewma", half_life=0)
