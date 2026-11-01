@@ -19,7 +19,7 @@ def script():
 @pytest.fixture
 def calls(returns, monkeypatch):
     st.cache_data.clear()
-    counts = {"download": 0, "optimiser": 0, "summarise": 0}
+    counts = {"download": 0, "optimiser": 0, "summarise": 0, "held": 0}
 
     def fake_load(tickers, *args, **kwargs):
         counts["download"] += 1
@@ -46,6 +46,13 @@ def calls(returns, monkeypatch):
         return original_summarise(*args, **kwargs)
 
     monkeypatch.setattr(analytics, "summarise", counted_summarise)
+    original_held = ui.build_held_estimates
+
+    def counted_held(*args, **kwargs):
+        counts["held"] += 1
+        return original_held(*args, **kwargs)
+
+    monkeypatch.setattr(ui, "build_held_estimates", counted_held)
     yield counts
     st.cache_data.clear()
 
@@ -203,3 +210,176 @@ def test_portfolio_snapshot_skips_zero_total_without_dividing(returns):
     snap = ui.portfolio_snapshot(wt.parse(pd.Series({"A": 0.001, "B": 99.999, "C": 0.0})), est, 0.01)
     assert snap.w.sum() == pytest.approx(1.0, abs=1e-12)
     assert np.isfinite(snap.summary["Volatility"])
+
+
+PORTFOLIO_METRICS = ["Expected return", "Volatility", "Sharpe ratio", "Beta to VOO", "Max drawdown", "95% weekly VaR"]
+METHODS = [(cov, ret) for cov in ("Ledoit-Wolf", "Sample") for ret in ("Shrunk", "Raw historical mean")]
+
+
+def portfolio_metrics(at):
+    return {label: metric(at, label) for label in PORTFOLIO_METRICS}
+
+
+def choose_methods(at, cov, ret):
+    at.radio[0].set_value(cov)
+    at.radio[1].set_value(ret)
+    at.run()
+    assert not at.exception
+
+
+def add_ticker(at, ticker):
+    at.session_state["selected"] = [*at.session_state["selected"], ticker]
+    at.run()
+    assert not at.exception
+
+
+@pytest.mark.parametrize("cov,ret", METHODS)
+def test_zero_weight_ticker_with_full_history_leaves_portfolio_metrics_unchanged(calls, returns, cov, ret):
+    at = launch(["A", "B", "C"])
+    choose_methods(at, cov, ret)
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0})
+    before = portfolio_metrics(at)
+    add_ticker(at, "D")
+    assert at.session_state["weights"]["D"] == 0.0
+    assert portfolio_metrics(at) == before
+    settings = dict(
+        cov_method="ledoit_wolf" if cov == "Ledoit-Wolf" else "sample", return_method="shrunk" if ret == "Shrunk" else "raw", shrinkage=0.5
+    )
+    est = ui.build_estimates(data.MarketData(returns=returns), ["A", "B", "C"], settings, set())
+    snap = ui.portfolio_snapshot(wt.parse(pd.Series({"A": 50.0, "B": 30.0, "C": 20.0})), est, 0.04)
+    assert before["Expected return"] == ui.pct(snap.summary["Expected return"])
+    assert before["Volatility"] == ui.pct(snap.summary["Volatility"])
+
+
+@pytest.mark.parametrize("cov,ret", METHODS)
+def test_zero_weight_ticker_with_shorter_history_leaves_portfolio_metrics_unchanged(calls, returns, cov, ret):
+    returns.loc[returns.index[:200], "D"] = np.nan
+    at = launch(["A", "B", "C"])
+    choose_methods(at, cov, ret)
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0})
+    before = portfolio_metrics(at)
+    assert not any("Frontier, Recommendations and Backtest" in c.value for c in at.caption)
+    add_ticker(at, "D")
+    assert portfolio_metrics(at) == before
+    assert any("**300 weeks** used" in m.value for m in at.markdown)
+    assert any("Frontier, Recommendations and Backtest tabs use the shared window" in c.value for c in at.caption)
+
+
+def test_portfolio_tab_states_the_weeks_and_range_used_for_held_assets(calls, returns):
+    returns.loc[returns.index[:200], "D"] = np.nan
+    at = launch(["A", "B", "C", "D"])
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0, 3: 0.0})
+    first, last = returns.index[0], returns.index[-1]
+    assert any(f"**300 weeks** used for the held assets, from {first:%d %b %Y} to {last:%d %b %Y}" in m.value for m in at.markdown)
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0, 3: 10.0})
+    assert any("**100 weeks** used" in m.value for m in at.markdown)
+    assert not any("shared window" in c.value for c in at.caption)
+
+
+def recommendations_script(frame):
+    from portfolio_risk import data, ui, weights as wt
+
+    settings = dict(cov_method="ledoit_wolf", return_method="shrunk", shrinkage=0.5)
+    tickers = ["A", "B", "C", "D", "E"]
+    est = ui.build_estimates(data.MarketData(returns=frame), tickers, settings, set())
+    p = dict(settings, risk_free=0.04, cap=0.5)
+    bundle = ui.compute_bundle(est, p, ui.optimisation_key(est, p))
+    parsed = wt.parse({"A": 50.0, "B": 30.0, "C": 20.0, "D": 0.0, "E": 0.0})
+    held = ui.build_held_estimates(data.MarketData(returns=frame), ["A", "B", "C"], settings)
+    ui.recommendations_tab(bundle, ui.portfolio_snapshot(parsed, est, 0.04, held))
+
+
+def test_recommendations_current_row_stays_on_shared_estimates_and_says_so(returns):
+    at = AppTest.from_function(recommendations_script, args=(returns,), default_timeout=TIMEOUT).run()
+    assert not at.exception
+    assert any("Current row" in c.value and "shared estimates" in c.value for c in at.caption)
+    shared = analytics.annual_covariance(returns[["A", "B", "C", "D", "E"]].dropna(), "ledoit_wolf")
+    w = pd.Series({"A": 0.5, "B": 0.3, "C": 0.2, "D": 0.0, "E": 0.0})
+    expected = ui.pct(analytics.portfolio_volatility(w, shared))
+    stats = next(df.value for df in at.dataframe if "Volatility" in df.value.columns)
+    assert ui.pct(stats.loc["Current", "Volatility"]) == expected
+
+
+def test_weight_edit_that_keeps_the_held_set_does_not_re_estimate(calls):
+    at = launch(["A", "B", "C", "D", "E"])
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0, 3: 0.0, 4: 0.0})
+    assert calls["held"] == 1
+    for value in [10.0, 12.75, 0.001, 55.5]:
+        edit(at, {0: value, 1: 30.0, 2: 20.0, 3: 0.0, 4: 0.0})
+    assert calls["held"] == 1
+    assert calls["download"] == 1
+    edit(at, {0: 10.0, 1: 30.0, 2: 20.0, 3: 5.0, 4: 0.0})
+    assert calls["held"] == 2
+    edit(at, {0: 10.0, 1: 30.0, 2: 20.0, 3: 0.0, 4: 0.0})
+    assert calls["held"] == 2
+    assert calls["download"] == 1
+
+
+def test_all_selected_assets_held_reuses_the_shared_estimates(calls):
+    at = launch(["A", "B", "C"])
+    edit(at, {0: 50.0, 1: 30.0, 2: 20.0})
+    edit(at, {0: 40.0, 1: 30.0, 2: 30.0})
+    assert calls["held"] == 0
+
+
+@pytest.mark.parametrize("cov,ret", METHODS)
+def test_single_held_asset_produces_finite_metrics(calls, returns, cov, ret):
+    at = launch(["A", "B", "C"])
+    choose_methods(at, cov, ret)
+    edit(at, {0: 0.0, 1: 100.0, 2: 0.0})
+    assert not any("at least two" in i.value for i in at.info)
+    values = portfolio_metrics(at)
+    for label, text in values.items():
+        assert np.isfinite(float(text.rstrip("%"))), (label, text)
+    window = returns.dropna(subset=["B", "VOO"])
+    assert values["Volatility"] == ui.pct(analytics.annual_covariance(window[["B"]], "ledoit_wolf" if cov == "Ledoit-Wolf" else "sample").loc["B", "B"] ** 0.5)
+
+
+def test_single_held_asset_has_full_risk_contribution_and_dashes_for_the_rest(returns):
+    est = ui.build_estimates(
+        data.MarketData(returns=returns), ["A", "B", "C"], dict(cov_method="ledoit_wolf", return_method="shrunk", shrinkage=0.5), set()
+    )
+    held = ui.build_held_estimates(
+        data.MarketData(returns=returns), ["B"], dict(cov_method="ledoit_wolf", return_method="shrunk", shrinkage=0.5)
+    )
+    snap = ui.portfolio_snapshot(wt.parse(pd.Series({"A": 0.0, "B": 7.0, "C": 0.0})), est, 0.04, held)
+    assert snap.table.loc["B", "Risk contribution"] == pytest.approx(1.0)
+    assert snap.table.loc[["A", "C"], ["Risk contribution", "Expected return", "Volatility", "Beta to VOO"]].isna().all().all()
+    assert snap.table["Weight (%)"].to_dict() == {"A": 0.0, "B": 100.0, "C": 0.0}
+    assert snap.w.to_dict() == {"A": 0.0, "B": 1.0, "C": 0.0}
+    html = ui.format_stats(snap.table, na_rep="–").to_html()
+    assert html.count("–") == 8
+    assert snap.summary["Volatility"] == pytest.approx(held.cov.loc["B", "B"] ** 0.5)
+
+
+def test_sharpe_ratio_shows_na_when_it_is_nan(calls, monkeypatch):
+    monkeypatch.setattr(analytics, "sharpe_ratio", lambda *args: float("nan"))
+    at = launch(["A", "B", "C"])
+    edit(at, {0: 10.0, 1: 20.0, 2: 30.0})
+    assert metric(at, "Sharpe ratio") == "n/a"
+
+
+def test_optimiser_still_stops_below_two_selected_assets(calls):
+    at = launch(["A"])
+    assert any("at least two" in i.value for i in at.info)
+
+
+def test_excel_current_rows_use_held_estimates_and_keep_zero_weight_tickers(returns):
+    from io import BytesIO
+
+    settings = dict(cov_method="ledoit_wolf", return_method="shrunk", shrinkage=0.5)
+    md = data.MarketData(returns=returns)
+    est = ui.build_estimates(md, ["A", "B", "C", "D"], settings, set())
+    held = ui.build_held_estimates(md, ["A", "B", "C"], settings)
+    parsed = wt.parse({"A": 50.0, "B": 30.0, "C": 20.0, "D": 0.0})
+    snap = ui.portfolio_snapshot(parsed, est, 0.04, held)
+    p = dict(settings, risk_free=0.04, cap=0.5)
+    bundle = ui.compute_bundle(est, p, ui.optimisation_key(est, p))
+    names = pd.Series({t: f"Name {t}" for t in "ABCD"})
+    book = ui.export_workbook_bytes(snap, names, est, p, bundle)
+    portfolio = pd.read_excel(BytesIO(book), sheet_name="Portfolio").set_index("Ticker")
+    assert portfolio["Weight (%)"].tolist() == pytest.approx([50, 30, 20, 0])
+    assert portfolio.loc["D", ["Risk contribution (%)", "Expected return (%)", "Volatility (%)"]].isna().all()
+    stats = pd.read_excel(BytesIO(book), sheet_name="Recommended statistics").set_index("Portfolio")
+    assert stats.loc["Current", "Volatility (%)"] == pytest.approx(round(snap.summary["Volatility"] * 100, 4))
+    assert stats.loc["Current", "Expected return (%)"] == pytest.approx(round(snap.summary["Expected return"] * 100, 4))
