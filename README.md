@@ -31,6 +31,12 @@ The optimiser, frontier and backtest run when you press **Run optimisation** or 
 
 **Export to Excel** writes the portfolio, the recommended weights and statistics for every optimised portfolio, and the settings used. **Import from Excel** (sidebar) reads the `Portfolio` sheet of such a file and restores the selected assets and their weights; the sidebar assumptions are not restored.
 
+## Add positions
+
+The second page of the app finds stocks to add to a portfolio. Upload a workbook exported from the Portfolio risk page, pick candidates (a watchlist from the universe, or the S&P 500), the maximum number of new positions (1 to 5) and a mode: **Reweight everything** recomputes all weights at risk parity; **Keep current holdings** holds their proportions fixed and sizes them as one block. Press **Run search**; changing an input does not rerun it, and the result is kept in the session for those inputs.
+
+Each finalist shows its diversification ratio, volatility, effective number of assets and backtest status, with the out-of-sample Sharpe ratio against a baseline without additions. A finalist is flagged when its status changes if February to April 2020 is left out. If a current holding has under 500 weeks of history no finalist can be backtested, and the page names the holding and its weeks. Selecting a finalist shows its trades; a trade inside the no-trade band (default 5 points and 25% of the target, both adjustable without rerunning) shows as "–". **Export target weights** writes an xlsx that the Portfolio risk page can import.
+
 ## Spreadsheet version
 
 Builds a workbook whose analytics are live formulas, so it can be used in Excel, LibreOffice or Google Sheets (upload the file to Drive) without the app:
@@ -60,10 +66,11 @@ Tests use synthetic data and need no network access.
 | `weights.py` | Typed-weight parsing, normalisation, selection bookkeeping and largest-remainder display rounding |
 | `backtest.py` | Walk-forward backtest |
 | `search.py` | Finds stocks to add to a portfolio under risk parity: beam search on the diversification ratio (last 156 weeks, EWMA covariance), walk-forward backtest filter on 10 years, no-trade band. Has a Newton risk parity solver for the search loop. No Streamlit code |
+| `ui_search.py` | Streamlit page for `search.py` ("Add positions") |
 | `excel_io.py` | Excel export and import |
 | `sheet_builder.py` | Formula-driven workbook generator |
 | `charts.py` | Plotly figures |
-| `ui.py` | Streamlit interface |
+| `ui.py` | Streamlit interface (Portfolio risk page); `streamlit_app.py` joins both pages with `st.navigation` |
 
 Prices are converted to USD and cached in `.cache/` for 24 hours. Set `PORTFOLIO_RISK_CACHE` to use another folder.
 
