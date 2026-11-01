@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import pytest
@@ -278,3 +279,24 @@ def test_download_is_asked_for_the_requested_period(monkeypatch, tmp_path):
 def test_unknown_period_is_rejected():
     with pytest.raises(ValueError):
         data.load_market_data(["A"], period="3y")
+
+
+def test_refreshing_a_stale_ten_year_file_for_a_five_year_request_keeps_it_ten_years(monkeypatch, tmp_path):
+    yahoo = FakeYahoo(monkeypatch, tmp_path, {"VOO": "USD"})
+    periods = []
+    original = yahoo.download
+    monkeypatch.setattr(data.yf, "download", lambda tickers, **kw: (periods.append(kw["period"]), original(tickers, **kw))[1])
+    monkeypatch.setattr(data, "_period_start", lambda period: pd.Timestamp("2024-02-01") if period == "5y" else pd.Timestamp("2000-01-03"))
+    write_cache_file("VOO", 10, "10y")
+    path = data._cache_path("VOO")
+    old = path.stat().st_mtime - 30 * 3600
+    os.utime(path, (old, old))
+
+    five = data.load_market_data([])
+    ten = data.load_market_data([], period="10y")
+
+    assert periods == ["10y"]
+    assert pd.read_parquet(path)["period"].iloc[0] == "10y"
+    assert five.prices.index.min() >= pd.Timestamp("2024-01-29")
+    assert len(ten.prices) == 12
+    assert len(five.prices) < len(ten.prices)

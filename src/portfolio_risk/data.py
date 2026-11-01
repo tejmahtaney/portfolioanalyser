@@ -71,6 +71,24 @@ def _period_start(period: str) -> pd.Timestamp:
     return start - pd.Timedelta(days=start.day_of_week)
 
 
+def _trim_to_period(close: pd.Series, period: str) -> pd.Series:
+    return close[close.index >= _period_start(period)]
+
+
+def _download_period(ticker: str, period: str) -> str:
+    """The longer of the requested period and the one stored in the ticker's cache file, if any.
+
+    Refreshing a stale 10-year file for a 5-year request must not shrink it to 5 years.
+    """
+    path = _cache_path(ticker)
+    if path.exists():
+        frame = pd.read_parquet(path)
+        stored = frame["period"].iloc[0] if "period" in frame else HISTORY_PERIOD
+        if stored in HISTORY_PERIODS and _years(stored) > _years(period):
+            return stored
+    return period
+
+
 def _download(ticker: str, period: str = HISTORY_PERIOD) -> tuple[pd.Series, str | None]:
     tk = yf.Ticker(ticker)
     hist = tk.history(period=period, interval="1wk", auto_adjust=True)
@@ -151,16 +169,17 @@ def fetch_prices(ticker: str, period: str = HISTORY_PERIOD) -> tuple[pd.Series, 
     cached = _read_cache(ticker, period)
     if cached is not None and cached[2]:
         return cached[0], cached[1], False
+    fetch_period = _download_period(ticker, period)
     try:
-        close, currency = _download(ticker, period)
+        close, currency = _download(ticker, fetch_period)
     except Exception:
         if cached is not None:
             return cached[0], cached[1], True
         raise
     source = "metadata" if currency else "guess"
     currency = currency or default_currency(ticker)
-    _write_cache(ticker, close, currency, source, period)
-    return close, currency, False
+    _write_cache(ticker, close, currency, source, fetch_period)
+    return _trim_to_period(close, period) if fetch_period != period else close, currency, False
 
 
 def _batch_close(frame: pd.DataFrame, ticker: str, single: bool) -> pd.Series | None:
@@ -252,13 +271,20 @@ def _collect(
         return results, failures, stale
 
     batch: dict[str, pd.Series] = {}
-    if todo:
-        note(f"Downloading {len(todo)} tickers in one batch…")
+    batch_period: dict[str, str] = {}  # the period each batch ticker was downloaded for, as stored on disk
+    by_period: dict[str, list[str]] = {}
+    for t in todo:
+        by_period.setdefault(_download_period(t, period), []).append(t)
+    for fetch_period, group in by_period.items():
+        note(f"Downloading {len(group)} tickers in one batch ({fetch_period})…")
         try:
-            batch = download_batch(todo, period)
+            got = download_batch(group, fetch_period)
         except Exception as exc:
             note(f"Batch download failed ({exc}); falling back to one call per ticker.")
-        note(f"Batch returned {len(batch)} of {len(todo)} tickers.")
+            got = {}
+        note(f"Batch returned {len(got)} of {len(group)} tickers.")
+        batch.update(got)
+        batch_period.update(dict.fromkeys(got, fetch_period))
     missing = [t for t in todo if t not in batch]
 
     known: dict[str, str] = {}  # batch tickers with a metadata currency already on disk
@@ -297,8 +323,8 @@ def _collect(
             currency, source = looked_up[t], "metadata"
         else:
             currency, source = default_currency(t), "guess"
-        _write_cache(t, close, currency, source, period)
-        results[t] = (close, currency)
+        _write_cache(t, close, currency, source, batch_period[t])
+        results[t] = (_trim_to_period(close, period) if batch_period[t] != period else close, currency)
     for t, close in unconfirmed.items():
         if looked_up.get(t):
             _update_currency(t, looked_up[t])
