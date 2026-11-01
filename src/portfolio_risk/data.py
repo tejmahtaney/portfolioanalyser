@@ -39,14 +39,27 @@ def _cache_path(ticker: str):
     return CACHE_DIR / "prices" / f"{ticker.replace('=', '_').replace('/', '_')}.parquet"
 
 
+def snap_to_monday(close: pd.Series) -> pd.Series:
+    """Dates every weekly bar on the Monday of its week; if two bars share a week, the later one wins.
+
+    Yahoo can date the current partial week on its last trading day, and exchanges disagree, so raw bar dates
+    cannot be trusted to line up across tickers.
+    """
+    close = close.sort_index()
+    index = pd.DatetimeIndex(close.index)
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    index = index.normalize()
+    close = close.set_axis(index - pd.to_timedelta(index.day_of_week, unit="D"))
+    return close[~close.index.duplicated(keep="last")]
+
+
 def _download(ticker: str) -> tuple[pd.Series, str | None]:
     tk = yf.Ticker(ticker)
     hist = tk.history(period=HISTORY_PERIOD, interval="1wk", auto_adjust=True)
     if hist.empty or "Close" not in hist:
         raise ValueError("no price data returned")
-    close = hist["Close"].dropna()
-    close.index = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
-    close = close[~close.index.duplicated(keep="last")]
+    close = snap_to_monday(hist["Close"].dropna())
     currency = None
     try:
         currency = tk.get_history_metadata().get("currency")
@@ -71,7 +84,7 @@ def _read_cache(ticker: str) -> tuple[pd.Series, str, bool, str] | None:
     frame = pd.read_parquet(path)
     fresh = (time.time() - path.stat().st_mtime) < CACHE_MAX_AGE_HOURS * 3600
     source = frame["currency_source"].iloc[0] if "currency_source" in frame else "guess"
-    return frame["close"], frame["currency"].iloc[0], fresh, "metadata" if source == "metadata" else "guess"
+    return snap_to_monday(frame["close"]), frame["currency"].iloc[0], fresh, "metadata" if source == "metadata" else "guess"
 
 
 def _write_cache(ticker: str, close: pd.Series, currency: str, source: str, keep_mtime: bool = False) -> None:
@@ -122,8 +135,7 @@ def _batch_close(frame: pd.DataFrame, ticker: str, single: bool) -> pd.Series | 
     close = close.dropna()
     if close.empty:
         return None
-    close.index = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
-    return close[~close.index.duplicated(keep="last")].astype(float)
+    return snap_to_monday(close).astype(float)
 
 
 def download_batch(tickers: list[str]) -> dict[str, pd.Series]:
