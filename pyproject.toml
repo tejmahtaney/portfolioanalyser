@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "portfolio-risk"
 version = "0.1.0"
 description = "Streamlit app that estimates portfolio risk and return and recommends optimised weights"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11"
 dependencies = [
     "streamlit",
     "pandas",

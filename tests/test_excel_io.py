@@ -42,6 +42,16 @@ def test_export_contains_all_recommendation_sheets():
     assert book["Recommended weights"]["Minimum variance"].tolist() == pytest.approx([10, 30, 60])
 
 
+def test_export_treats_any_beta_column_as_unscaled():
+    portfolio, _, _ = sample()
+    portfolio = portfolio.rename(columns={"Beta to VOO": "Beta to SPY"})
+    portfolio["Beta to SPY"] = [1.123456, 0.9, 0.4]
+    book = pd.read_excel(BytesIO(excel_io.export_workbook(portfolio, {})), sheet_name="Portfolio")
+    assert "Beta to SPY" in book.columns
+    assert "Beta to SPY (%)" not in book.columns
+    assert book["Beta to SPY"].tolist() == pytest.approx([1.1235, 0.9, 0.4])
+
+
 def test_export_without_recommendations_still_imports():
     portfolio, _, _ = sample()
     blob = excel_io.export_workbook(portfolio, {})

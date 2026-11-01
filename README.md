@@ -5,10 +5,10 @@ Streamlit app that estimates risk and return for a user-built portfolio and reco
 
 ## Install
 
-Requires Python 3.11.
+Requires Python 3.11 or newer.
 
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
