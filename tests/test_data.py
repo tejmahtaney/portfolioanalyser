@@ -224,3 +224,57 @@ def test_old_cache_files_with_mid_week_dates_are_normalised_on_read(monkeypatch,
     assert fresh
     assert (close.index.day_of_week == 0).all()
     assert list(close) == list(old)
+
+
+def write_cache_file(ticker, years, period=None, n=12):
+    idx = pd.date_range("2024-01-01", periods=n, freq="W-MON")
+    frame = pd.DataFrame({"close": np.linspace(10, 12, n), "currency": "USD", "currency_source": "metadata"}, index=idx)
+    if period is not None:
+        frame["period"] = period
+    path = data._cache_path(ticker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path)
+
+
+def test_ten_year_request_with_only_a_five_year_cache_file_downloads(monkeypatch, tmp_path):
+    yahoo = FakeYahoo(monkeypatch, tmp_path, {"VOO": "USD", "A": "USD"})
+    monkeypatch.setattr(data, "_period_start", lambda period: pd.Timestamp("2000-01-03"))
+    write_cache_file("A", 5, "5y")
+    write_cache_file("VOO", 5)  # a file from before the tag existed also counts as 5 years
+    data.load_market_data(["A"], period="10y")
+    assert sorted(yahoo.downloaded) == ["A", "VOO"]
+    assert pd.read_parquet(data._cache_path("A"))["period"].iloc[0] == "10y"
+
+
+def test_five_year_request_with_a_ten_year_cache_file_does_not_download(monkeypatch, tmp_path):
+    yahoo = FakeYahoo(monkeypatch, tmp_path, {"VOO": "USD", "A": "USD"})
+    monkeypatch.setattr(data, "_period_start", lambda period: pd.Timestamp("2000-01-03"))
+    write_cache_file("A", 10, "10y")
+    write_cache_file("VOO", 10, "10y")
+    md = data.load_market_data(["A"])
+    assert yahoo.downloaded == []
+    assert len(md.prices) == 12
+
+
+def test_five_year_request_trims_a_ten_year_cache_file(monkeypatch, tmp_path):
+    FakeYahoo(monkeypatch, tmp_path, {"VOO": "USD"})
+    monkeypatch.setattr(data, "_period_start", lambda period: pd.Timestamp("2024-02-01"))
+    write_cache_file("VOO", 10, "10y")
+    close, _, _, _ = data._read_cache("VOO", "5y")
+    assert close.index.min() >= pd.Timestamp("2024-01-29")
+    assert len(data._read_cache("VOO", "10y")[0]) == 12
+
+
+def test_download_is_asked_for_the_requested_period(monkeypatch, tmp_path):
+    asked = []
+    yahoo = FakeYahoo(monkeypatch, tmp_path, {"VOO": "USD"})
+    original = yahoo.download
+    monkeypatch.setattr(data.yf, "download", lambda tickers, **kw: (asked.append(kw["period"]), original(tickers, **kw))[1])
+    data.load_market_data([], period="10y")
+    data.load_market_data([])
+    assert asked == ["10y"]  # the second call is served by the fresh ten-year file
+
+
+def test_unknown_period_is_rejected():
+    with pytest.raises(ValueError):
+        data.load_market_data(["A"], period="3y")

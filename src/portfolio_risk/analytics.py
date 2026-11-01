@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.covariance import LedoitWolf
 
-from .config import PERIODS_PER_YEAR
+from .config import EWMA_HALF_LIFE_WEEKS, PERIODS_PER_YEAR
 
 
 def normalise_weights(weights: pd.Series) -> pd.Series:
@@ -17,13 +17,39 @@ def normalise_weights(weights: pd.Series) -> pd.Series:
     return weights / total
 
 
-def annual_covariance(returns: pd.DataFrame, method: str = "ledoit_wolf") -> pd.DataFrame:
+def _ewma_weights(n: int, half_life: float) -> np.ndarray:
+    """Weight 0.5 ** (age / half_life) per week, newest week at age 0, normalised to sum to 1."""
+    if not half_life > 0:
+        raise ValueError("The half-life must be positive.")
+    w = 0.5 ** (np.arange(n)[::-1] / half_life)
+    return w / w.sum()
+
+
+def effective_weeks(n: int, half_life: float) -> float:
+    """Effective sample size of n exponentially weighted weeks: (sum w)^2 / sum w^2."""
+    w = 0.5 ** (np.arange(n)[::-1] / half_life)
+    return float(w.sum() ** 2 / (w**2).sum())
+
+
+def annual_covariance(
+    returns: pd.DataFrame, method: str = "ledoit_wolf", half_life: float = EWMA_HALF_LIFE_WEEKS
+) -> pd.DataFrame:
+    """half_life (weeks) is used only by the "ewma" method."""
     if method == "ledoit_wolf":
         weekly = pd.DataFrame(
             LedoitWolf().fit(returns.to_numpy()).covariance_, index=returns.columns, columns=returns.columns
         )
     elif method == "sample":
         weekly = returns.cov()
+    elif method == "ewma":
+        x = returns.to_numpy()
+        w = _ewma_weights(len(x), half_life)
+        # sqrt(n * w) per row, so that Z'Z / n is the weighted covariance and Ledoit-Wolf sees n rows of
+        # roughly unit weight.
+        z = (x - w @ x) * np.sqrt(w * len(x))[:, None]
+        weekly = pd.DataFrame(
+            LedoitWolf(assume_centered=True).fit(z).covariance_, index=returns.columns, columns=returns.columns
+        )
     else:
         raise ValueError(f"Unknown covariance method: {method}")
     return weekly * PERIODS_PER_YEAR

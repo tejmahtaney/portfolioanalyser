@@ -17,6 +17,7 @@ from .config import (
     CACHE_MAX_AGE_HOURS,
     HIGH_CORRELATION,
     HISTORY_PERIOD,
+    HISTORY_PERIODS,
     ROLL_JUMP_SIGMAS,
 )
 
@@ -54,9 +55,25 @@ def snap_to_monday(close: pd.Series) -> pd.Series:
     return close[~close.index.duplicated(keep="last")]
 
 
-def _download(ticker: str) -> tuple[pd.Series, str | None]:
+def check_period(period: str) -> str:
+    if period not in HISTORY_PERIODS:
+        raise ValueError(f"Unknown history period {period!r}; use one of {', '.join(HISTORY_PERIODS)}.")
+    return period
+
+
+def _years(period: str) -> int:
+    return int(period.removesuffix("y"))
+
+
+def _period_start(period: str) -> pd.Timestamp:
+    """Monday of the week holding the date one period ago; bars before it are outside the period."""
+    start = pd.Timestamp.now().normalize() - pd.DateOffset(years=_years(period))
+    return start - pd.Timedelta(days=start.day_of_week)
+
+
+def _download(ticker: str, period: str = HISTORY_PERIOD) -> tuple[pd.Series, str | None]:
     tk = yf.Ticker(ticker)
-    hist = tk.history(period=HISTORY_PERIOD, interval="1wk", auto_adjust=True)
+    hist = tk.history(period=period, interval="1wk", auto_adjust=True)
     if hist.empty or "Close" not in hist:
         raise ValueError("no price data returned")
     close = snap_to_monday(hist["Close"].dropna())
@@ -73,28 +90,47 @@ def _download(ticker: str) -> tuple[pd.Series, str | None]:
     return close.astype(float), currency
 
 
-def _read_cache(ticker: str) -> tuple[pd.Series, str, bool, str] | None:
+def _read_cache(
+    ticker: str, period: str = HISTORY_PERIOD, ignore_period: bool = False
+) -> tuple[pd.Series, str, bool, str] | None:
     """(close prices, currency, is_fresh, currency_source) from the parquet cache, or None when there is no file.
 
     currency_source is "metadata" or "guess". Files written before the column existed count as "guess".
+
+    One file per ticker, tagged with the period it was downloaded for. Files written before the tag existed hold
+    HISTORY_PERIOD. A file covering less than the requested period counts as no file; one covering more is trimmed
+    to the request. ignore_period skips both and returns the file as stored.
     """
     path = _cache_path(ticker)
     if not path.exists():
         return None
     frame = pd.read_parquet(path)
+    stored = frame["period"].iloc[0] if "period" in frame else HISTORY_PERIOD
+    if not ignore_period and stored != period:
+        if stored not in HISTORY_PERIODS or _years(stored) < _years(period):
+            return None
+        frame = frame[frame.index >= _period_start(period)]
+        if frame.empty:
+            return None
     fresh = (time.time() - path.stat().st_mtime) < CACHE_MAX_AGE_HOURS * 3600
     source = frame["currency_source"].iloc[0] if "currency_source" in frame else "guess"
     return snap_to_monday(frame["close"]), frame["currency"].iloc[0], fresh, "metadata" if source == "metadata" else "guess"
 
 
-def _write_cache(ticker: str, close: pd.Series, currency: str, source: str, keep_mtime: bool = False) -> None:
-    """keep_mtime leaves the file's age alone when only the currency changed, so old prices do not look fresh."""
+def _write_cache(ticker: str, close: pd.Series, currency: str, source: str, period: str = HISTORY_PERIOD) -> None:
     path = _cache_path(ticker)
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = path.stat() if keep_mtime and path.exists() else None
-    pd.DataFrame({"close": close, "currency": currency, "currency_source": source}).to_parquet(path)
-    if stamp is not None:
-        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    pd.DataFrame({"close": close, "currency": currency, "currency_source": source, "period": period}).to_parquet(path)
+
+
+def _update_currency(ticker: str, currency: str) -> None:
+    """Rewrites only the currency of a cache file, keeping its prices and its age so old prices do not look fresh."""
+    path = _cache_path(ticker)
+    stamp = path.stat()
+    frame = pd.read_parquet(path)
+    frame["currency"], frame["currency_source"] = currency, "metadata"
+    frame.to_parquet(path)
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
 
 
 def lookup_currency(ticker: str) -> str | None:
@@ -110,20 +146,20 @@ def lookup_currency(ticker: str) -> str | None:
     return None
 
 
-def fetch_prices(ticker: str) -> tuple[pd.Series, str, bool]:
+def fetch_prices(ticker: str, period: str = HISTORY_PERIOD) -> tuple[pd.Series, str, bool]:
     """Returns (close prices, currency, used_stale_cache). Raises if there is no usable data."""
-    cached = _read_cache(ticker)
+    cached = _read_cache(ticker, period)
     if cached is not None and cached[2]:
         return cached[0], cached[1], False
     try:
-        close, currency = _download(ticker)
+        close, currency = _download(ticker, period)
     except Exception:
         if cached is not None:
             return cached[0], cached[1], True
         raise
     source = "metadata" if currency else "guess"
     currency = currency or default_currency(ticker)
-    _write_cache(ticker, close, currency, source)
+    _write_cache(ticker, close, currency, source, period)
     return close, currency, False
 
 
@@ -138,12 +174,12 @@ def _batch_close(frame: pd.DataFrame, ticker: str, single: bool) -> pd.Series | 
     return snap_to_monday(close).astype(float)
 
 
-def download_batch(tickers: list[str]) -> dict[str, pd.Series]:
+def download_batch(tickers: list[str], period: str = HISTORY_PERIOD) -> dict[str, pd.Series]:
     """One yf.download call for every ticker. Tickers that come back empty are left out."""
     if not tickers:
         return {}
     frame = yf.download(
-        tickers, period=HISTORY_PERIOD, interval="1wk", auto_adjust=True,
+        tickers, period=period, interval="1wk", auto_adjust=True,
         group_by="ticker", threads=True, progress=False,
     )
     if frame is None or frame.empty:
@@ -186,12 +222,12 @@ def common_window(returns: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
 
 
 def _known_currency(ticker: str) -> str:
-    cached = _read_cache(ticker)
+    cached = _read_cache(ticker, ignore_period=True)
     return cached[1] if cached is not None else default_currency(ticker)
 
 
 def _collect(
-    wanted: list[str], max_workers: int, note: Callable[[str], None]
+    wanted: list[str], max_workers: int, note: Callable[[str], None], period: str = HISTORY_PERIOD
 ) -> tuple[dict[str, tuple[pd.Series, str]], dict[str, str], list[str]]:
     """Fresh disk cache first, then one batched download for the rest, then per-ticker calls for the leftovers.
 
@@ -204,7 +240,7 @@ def _collect(
     todo = []
     unconfirmed: dict[str, pd.Series] = {}  # fresh cache files whose currency is only a guess
     for t in wanted:
-        cached = _read_cache(t)
+        cached = _read_cache(t, period)
         if cached is not None and cached[2]:
             results[t] = (cached[0], cached[1])
             if cached[3] != "metadata" and not t.endswith("=X"):
@@ -219,7 +255,7 @@ def _collect(
     if todo:
         note(f"Downloading {len(todo)} tickers in one batch…")
         try:
-            batch = download_batch(todo)
+            batch = download_batch(todo, period)
         except Exception as exc:
             note(f"Batch download failed ({exc}); falling back to one call per ticker.")
         note(f"Batch returned {len(batch)} of {len(todo)} tickers.")
@@ -227,14 +263,14 @@ def _collect(
 
     known: dict[str, str] = {}  # batch tickers with a metadata currency already on disk
     for t in batch:
-        cached = _read_cache(t)
+        cached = _read_cache(t, ignore_period=True)
         if cached is not None and cached[3] == "metadata":
             known[t] = cached[1]
     to_look_up = [*unconfirmed, *(t for t in batch if t not in known and not t.endswith("=X"))]
 
     def work(t: str):
         try:
-            return t, fetch_prices(t), None
+            return t, fetch_prices(t, period), None
         except Exception as exc:
             return t, None, str(exc) or type(exc).__name__
 
@@ -261,11 +297,11 @@ def _collect(
             currency, source = looked_up[t], "metadata"
         else:
             currency, source = default_currency(t), "guess"
-        _write_cache(t, close, currency, source)
+        _write_cache(t, close, currency, source, period)
         results[t] = (close, currency)
     for t, close in unconfirmed.items():
         if looked_up.get(t):
-            _write_cache(t, close, looked_up[t], "metadata", keep_mtime=True)
+            _update_currency(t, looked_up[t])
             results[t] = (close, looked_up[t])
     for t, res, err in fetched:
         if err is not None:
@@ -279,8 +315,12 @@ def _collect(
 
 
 def load_market_data(
-    tickers: list[str], max_workers: int = 4, progress: Callable[[str], None] | None = None
+    tickers: list[str],
+    max_workers: int = 4,
+    progress: Callable[[str], None] | None = None,
+    period: str = HISTORY_PERIOD,
 ) -> MarketData:
+    check_period(period)
     wanted = list(dict.fromkeys([*tickers, BENCHMARK]))
     log: list[str] = []
 
@@ -291,7 +331,7 @@ def load_market_data(
 
     # Likely FX pairs ride along in the same batch instead of costing a second round trip.
     fx_guess = sorted({fx_ticker(c) for c in map(_known_currency, wanted) if c != "USD"})
-    results, failures, stale = _collect(list(dict.fromkeys([*wanted, *fx_guess])), max_workers, note)
+    results, failures, stale = _collect(list(dict.fromkeys([*wanted, *fx_guess])), max_workers, note, period)
     fx_fetched = {t: results.pop(t) for t in fx_guess if t in results}
     for t in fx_guess:
         if t in failures:
@@ -304,7 +344,7 @@ def load_market_data(
             if fx_ticker(ccy) in fx_fetched:
                 fx[ccy] = fx_fetched[fx_ticker(ccy)][0]
             else:
-                series, _, was_stale = fetch_prices(fx_ticker(ccy))
+                series, _, was_stale = fetch_prices(fx_ticker(ccy), period)
                 fx[ccy] = series
                 if was_stale:
                     stale.append(fx_ticker(ccy))

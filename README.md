@@ -54,8 +54,8 @@ Tests use synthetic data and need no network access.
 | Module | Concern |
 | --- | --- |
 | `universe.py` | Asset universe. Add entries to `STI`, `INDEX_FUNDS` or `FUTURES`; S&P 500 is scraped from Wikipedia |
-| `data.py` | One batched yfinance download for tickers missing from the parquet cache (per-ticker fallback), USD conversion, weekly returns (bar dates snapped to Monday), data-quality checks |
-| `analytics.py` | Covariance, expected returns, beta, risk contribution, drawdown, VaR |
+| `data.py` | History period (`5y` default, `10y` option; the cache file is tagged with its period). One batched yfinance download for tickers missing from the parquet cache (per-ticker fallback), USD conversion, weekly returns (bar dates snapped to Monday), data-quality checks |
+| `analytics.py` | Covariance (Ledoit-Wolf, sample, and an optional exponentially weighted `ewma`), expected returns, beta, risk contribution, drawdown, VaR |
 | `optimiser.py` | cvxpy optimisers and efficient frontier. DPP problems built once per `Workspace` and reused across the 40 frontier points and backtest windows |
 | `weights.py` | Typed-weight parsing, normalisation, selection bookkeeping and largest-remainder display rounding |
 | `backtest.py` | Walk-forward backtest |
