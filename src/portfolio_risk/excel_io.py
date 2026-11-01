@@ -5,6 +5,10 @@ from io import BytesIO
 
 import pandas as pd
 
+from .config import BENCHMARK
+
+BETA_PREFIX = "Beta to "
+BETA_COLUMN = f"{BETA_PREFIX}{BENCHMARK}"
 PORTFOLIO_SHEET = "Portfolio"
 WEIGHT_COLUMN = "Weight (%)"
 
@@ -25,9 +29,10 @@ def export_workbook(
         table = portfolio.copy()
         names = table.pop("Name")
         out = _percent(table)
-        out.columns = [f"{c} (%)" if c != "Beta to VOO" else c for c in out.columns]
-        if "Beta to VOO" in out:
-            out["Beta to VOO"] = table["Beta to VOO"].round(4)
+        betas = [c for c in table.columns if str(c).startswith(BETA_PREFIX)]
+        out.columns = [c if c in betas else f"{c} (%)" for c in out.columns]
+        for c in betas:
+            out[c] = table[c].round(4)
         out.insert(0, "Name", names)
         out.rename_axis("Ticker").reset_index().to_excel(writer, sheet_name=PORTFOLIO_SHEET, index=False)
         if weights is not None:
