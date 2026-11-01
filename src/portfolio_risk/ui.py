@@ -44,13 +44,19 @@ class Estimates:
 
 @dataclass
 class Snapshot:
-    """Statistics that depend on the weights. Cheap matrix operations, recomputed on every edit."""
+    """Statistics that depend on the weights. Cheap matrix operations, recomputed on every edit.
+
+    `w` spans every selected ticker and feeds the optimiser tabs. `summary`, `var95`, `beta` and `table` come from `est`,
+    the estimates over the held tickers only. `shared` is the estimates over every selected ticker.
+    """
 
     w: pd.Series
     summary: dict[str, float]
     var95: float
     beta: float | None
     table: pd.DataFrame
+    est: Estimates
+    shared: Estimates
 
 
 @dataclass
@@ -79,7 +85,13 @@ def cached_market_data(tickers: tuple[str, ...]):
     return data.load_market_data(list(tickers))
 
 
-def build_estimates(md: data.MarketData, selected: list[str], settings: dict, futures: set[str]) -> Estimates:
+def short_history_warning(weeks: int) -> str:
+    return f"Only {weeks} weeks of common history remain, fewer than {MIN_WEEKS_WARNING}. Estimates will be unreliable."
+
+
+def build_estimates(
+    md: data.MarketData, selected: list[str], settings: dict, futures: set[str], min_assets: int = 2
+) -> Estimates:
     tickers = [t for t in selected if t in md.returns.columns]
     empty = pd.DataFrame()
     if not tickers:
@@ -92,10 +104,8 @@ def build_estimates(md: data.MarketData, selected: list[str], settings: dict, fu
     if not bench_ok:
         est.warnings.append(f"{BENCHMARK} could not be loaded, so betas are unavailable.")
     if len(window) < MIN_WEEKS_WARNING:
-        est.warnings.append(
-            f"Only {len(window)} weeks of common history remain, fewer than {MIN_WEEKS_WARNING}. Estimates will be unreliable."
-        )
-    if len(tickers) < 2:
+        est.warnings.append(short_history_warning(len(window)))
+    if len(tickers) < min_assets:
         est.info = "Select at least two assets to estimate a covariance matrix."
         return est
     est.cov = analytics.annual_covariance(est.returns, settings["cov_method"])
@@ -119,26 +129,66 @@ def cached_estimates(
     return build_estimates(cached_market_data(tickers), list(tickers), settings, set(_futures))
 
 
-def portfolio_snapshot(parsed: wt.Parsed, est: Estimates, risk_free: float) -> Snapshot | None:
-    """Returns None when there is nothing to calculate: a zero total or negative weights."""
+def held_tickers(parsed: wt.Parsed, tickers: list[str]) -> tuple[str, ...]:
+    """Sorted tickers whose normalised weight is above 0."""
+    if parsed.normalised is None:
+        return ()
+    return tuple(sorted(t for t in tickers if parsed.normalised.get(t, 0.0) > 0))
+
+
+def build_held_estimates(md: data.MarketData, held: list[str], settings: dict) -> Estimates:
+    """Window, covariance, expected returns and betas over the held tickers alone. One asset is enough."""
+    return build_estimates(md, held, settings, set(), min_assets=1)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_held_estimates(
+    held: tuple[str, ...], cov_method: str, return_method: str, shrinkage: float, _selected: tuple[str, ...]
+) -> Estimates:
+    """Keyed on the sorted held tuple and the settings. `_selected` only locates the cached market data of the full selection."""
+    settings = dict(cov_method=cov_method, return_method=return_method, shrinkage=shrinkage)
+    return build_held_estimates(cached_market_data(_selected), list(held), settings)
+
+
+def held_estimates(parsed: wt.Parsed, est: Estimates, p: dict) -> Estimates | None:
+    """Estimates over the held tickers. When every selected ticker is held these are the shared estimates."""
+    held = held_tickers(parsed, est.tickers)
+    if not held:
+        return None
+    if held == tuple(sorted(est.tickers)):
+        return est
+    return cached_held_estimates(held, p["cov_method"], p["return_method"], p["shrinkage"], tuple(sorted(p["selected"])))
+
+
+def portfolio_snapshot(parsed: wt.Parsed, est: Estimates, risk_free: float, held_est: Estimates | None = None) -> Snapshot | None:
+    """Returns None when there is nothing to calculate: a zero total, negative weights or no usable held estimates.
+
+    The statistics use `held_est`, which defaults to `est`; tickers outside it get empty estimate cells.
+    """
     if parsed.normalised is None:
         return None
+    held_est = est if held_est is None else held_est
+    if held_est.error or held_est.cov is None:
+        return None
     w = parsed.normalised.reindex(est.tickers)
-    summary = analytics.summarise(w, est.mu, est.cov, est.returns, risk_free)
-    port = analytics.portfolio_returns(est.returns, w)
+    wh = w.reindex(held_est.tickers)
+    summary = analytics.summarise(wh, held_est.mu, held_est.cov, held_est.returns, risk_free)
+    port = analytics.portfolio_returns(held_est.returns, wh)
     table = pd.DataFrame(
         {
-            "Weight (%)": wt.largest_remainder(w * 100),
-            "Risk contribution": analytics.risk_contributions(w, est.cov),
-            "Expected return": est.mu[w.index],
-            "Volatility": pd.Series({t: est.cov.loc[t, t] ** 0.5 for t in w.index}),
+            "Weight (%)": wt.largest_remainder(wh * 100),
+            "Risk contribution": analytics.risk_contributions(wh, held_est.cov),
+            "Expected return": held_est.mu[wh.index],
+            "Volatility": pd.Series({t: held_est.cov.loc[t, t] ** 0.5 for t in wh.index}),
         }
     )
     beta = None
-    if est.betas is not None:
-        table["Beta to VOO"] = est.betas[w.index]
-        beta = float(w @ est.betas[w.index])
-    return Snapshot(w, summary, analytics.historical_var(port), beta, table)
+    if held_est.betas is not None:
+        table["Beta to VOO"] = held_est.betas[wh.index]
+        beta = float(wh @ held_est.betas[wh.index])
+    table = table.reindex(est.tickers)
+    table["Weight (%)"] = table["Weight (%)"].fillna(0.0)
+    return Snapshot(w, summary, analytics.historical_var(port), beta, table, held_est, est)
 
 
 def optimise_all(mu, cov, rf, cap, workspace=None) -> dict[str, optimiser.Result]:
@@ -313,24 +363,36 @@ def pct(x: float) -> str:
     return f"{x:.2%}"
 
 
-def format_stats(table: pd.DataFrame) -> pd.DataFrame:
+def format_stats(table: pd.DataFrame, na_rep: str | None = None) -> pd.DataFrame:
     return table.style.format(
-        {c: ("{:.2f}" if "Sharpe" in c or "Beta" in c or "(%)" in c else "{:.2%}") for c in table.columns}
+        {c: ("{:.2f}" if "Sharpe" in c or "Beta" in c or "(%)" in c else "{:.2%}") for c in table.columns}, na_rep=na_rep
     )
 
 
-def portfolio_tab(snap: Snapshot | None):
+def portfolio_tab(snap: Snapshot | None, held_error: str | None = None):
+    if held_error:
+        st.error(f"The held assets cannot be estimated. {held_error}")
+        return
     if snap is None:
         st.info("Enter at least one positive weight to see portfolio statistics.")
         return
+    held, shared = snap.est, snap.shared
+    window = held.window
+    st.write(f"**{len(window)} weeks** used for the held assets, from {window.index[0]:%d %b %Y} to {window.index[-1]:%d %b %Y}.")
+    differs = not window.index.equals(shared.window.index)
+    if differs:
+        st.caption("The Frontier, Recommendations and Backtest tabs use the shared window of all selected assets.")
+        if len(window) < MIN_WEEKS_WARNING:
+            st.warning(short_history_warning(len(window)))
+    sharpe = snap.summary["Sharpe ratio"]
     cols = st.columns(6)
     cols[0].metric("Expected return", pct(snap.summary["Expected return"]))
     cols[1].metric("Volatility", pct(snap.summary["Volatility"]))
-    cols[2].metric("Sharpe ratio", f"{snap.summary['Sharpe ratio']:.2f}")
+    cols[2].metric("Sharpe ratio", "n/a" if pd.isna(sharpe) else f"{sharpe:.2f}")
     cols[3].metric("Beta to VOO", "n/a" if snap.beta is None else f"{snap.beta:.2f}")
     cols[4].metric("Max drawdown", pct(snap.summary["Max drawdown"]))
     cols[5].metric("95% weekly VaR", pct(snap.var95), help="Loss exceeded in 5% of weeks.")
-    st.dataframe(format_stats(snap.table), width="stretch")
+    st.dataframe(format_stats(snap.table, na_rep="–"), width="stretch")
 
 
 def frontier_tab(bundle: OptBundle, snap: Snapshot | None):
@@ -370,6 +432,11 @@ def recommendations_tab(bundle: OptBundle, snap: Snapshot | None):
         "Shown to 2 decimal places, rounded so that each column sums to 100.00."
     )
     st.subheader("Portfolio statistics")
+    if snap is not None:
+        st.caption(
+            "The Current row and the Your portfolio point on the frontier use the shared estimates of all selected assets, "
+            "so they can differ from the Portfolio tab when some selected assets have zero weight."
+        )
     exact = pd.DataFrame(weights)
     summary = pd.DataFrame({n: analytics.summarise(exact[n], est.mu, est.cov, est.returns, bundle.risk_free) for n in exact}).T
     st.dataframe(format_stats(summary), width="stretch")
@@ -433,24 +500,28 @@ def quality_tab(md, tickers, window, futures_flags, corr_pairs, uni):
 
 
 def export_workbook_bytes(snap: Snapshot, names, est: Estimates, p: dict, bundle: OptBundle | None) -> bytes:
-    w = snap.w
+    """The Current rows use the held-asset estimates; the optimiser columns use the shared estimates `est`."""
+    w, held = snap.w, snap.est
+    wh = w.reindex(held.tickers)
     portfolio = pd.DataFrame(
         {
             "Name": [names[t] for t in w.index],
             "Weight": w,
-            "Risk contribution": analytics.risk_contributions(w, est.cov),
-            "Expected return": est.mu[w.index],
-            "Volatility": pd.Series({t: est.cov.loc[t, t] ** 0.5 for t in w.index}),
+            "Risk contribution": analytics.risk_contributions(wh, held.cov).reindex(w.index),
+            "Expected return": held.mu[wh.index].reindex(w.index),
+            "Volatility": pd.Series({t: held.cov.loc[t, t] ** 0.5 for t in wh.index}).reindex(w.index),
         }
     )
-    if est.betas is not None:
-        portfolio["Beta to VOO"] = est.betas[w.index]
+    if held.betas is not None:
+        portfolio["Beta to VOO"] = held.betas[wh.index].reindex(w.index)
     weights = statistics = None
     if bundle is not None and bundle.results is not None:
         weights = pd.DataFrame({"Current": w, **{n: r.weights for n, r in bundle.results.items()}})
-        statistics = pd.DataFrame(
-            {n: analytics.summarise(weights[n], est.mu, est.cov, est.window[w.index], p["risk_free"]) for n in weights}
-        ).T
+        rows = {"Current": analytics.summarise(wh, held.mu, held.cov, held.returns, p["risk_free"])}
+        rows.update(
+            {n: analytics.summarise(weights[n], est.mu, est.cov, est.window[w.index], p["risk_free"]) for n in weights.columns[1:]}
+        )
+        statistics = pd.DataFrame(rows).T
     settings = {
         "Risk-free rate": f"{p['risk_free']:.2%}",
         "Covariance method": p["cov_method"],
@@ -460,6 +531,9 @@ def export_workbook_bytes(snap: Snapshot, names, est: Estimates, p: dict, bundle
         "Weeks used": str(len(est.window)),
         "Window": f"{est.window.index[0]:%Y-%m-%d} to {est.window.index[-1]:%Y-%m-%d}",
     }
+    if not held.window.index.equals(est.window.index):
+        settings["Weeks used (held assets)"] = str(len(held.window))
+        settings["Window (held assets)"] = f"{held.window.index[0]:%Y-%m-%d} to {held.window.index[-1]:%Y-%m-%d}"
     return excel_io.export_workbook(portfolio, settings, weights, statistics)
 
 
@@ -477,7 +551,8 @@ def workspace(est: Estimates, p: dict, uni: pd.DataFrame):
     right.button("Clear weights", on_click=set_weights, args=({t: 0.0 for t in shown},), width="stretch")
     parsed = wt.parse(weight_table(shown, names))
     show_weight_summary(summary_slot, parsed)
-    snap = portfolio_snapshot(parsed, est, p["risk_free"])
+    held_est = held_estimates(parsed, est, p)
+    snap = portfolio_snapshot(parsed, est, p["risk_free"], held_est)
 
     key = optimisation_key(est, p)
     bundle = recall(state, key)
@@ -503,7 +578,7 @@ def workspace(est: Estimates, p: dict, uni: pd.DataFrame):
     with tabs[0]:
         if tabs[0].open is not False:
             st.caption(DISCLAIMER)
-            portfolio_tab(snap)
+            portfolio_tab(snap, held_est.error if held_est is not None else None)
     for name, tab in zip(OPTIMISER_TABS, tabs[1:4]):
         with tab:
             if tab.open is not False:

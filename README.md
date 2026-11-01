@@ -25,9 +25,14 @@ Weights are typed as decimals (for example 0.5, 12.75 or 0.001), stored as float
 
 | Changes | Recomputes |
 | --- | --- |
-| A typed weight | Volatility, beta, risk contributions, VaR, drawdown, and the user's point on the frontier. Nothing is downloaded and no covariance is estimated. |
-| Tickers or estimation settings | Prices (only tickers missing from the disk cache), covariance, expected returns |
+| A typed weight that keeps the same tickers held | Volatility, beta, risk contributions, VaR, drawdown, and the user's point on the frontier. Nothing is downloaded and nothing is estimated. |
+| A typed weight that moves a ticker between zero and positive | The same, plus the common window, covariance, expected returns and betas of the held tickers. Cached per sorted held set and settings, and built from the prices already loaded, so nothing is downloaded. |
+| Tickers or estimation settings | Prices (only tickers missing from the disk cache), covariance, expected returns for all selected tickers, and for the held tickers |
 | Press **Run optimisation**, or open Frontier, Recommendations or Backtest for the first time | Optimiser, frontier and backtest, kept in the session per tickers and settings |
+
+A ticker is held when its normalised weight is above 0. The Portfolio tab (metrics and table) and the Current sheets of the Excel export use estimates built from the held tickers alone: their own common window, covariance and expected returns, with the same sidebar settings. Adding a ticker at weight 0 therefore changes none of those numbers, and one held asset is enough. Zero-weight rows stay in the Portfolio table with "–" in the estimate columns. The Portfolio tab states the weeks and date range used.
+
+The optimiser, frontier, recommendations and backtest use the shared estimates over all selected tickers, whatever the weights. In the Recommendations tab the Current statistics row, and the Your portfolio point on the frontier, are computed on those shared estimates, so they can differ from the Portfolio tab when a selected ticker has zero weight or a shorter history.
 
 ## Excel import and export
 
