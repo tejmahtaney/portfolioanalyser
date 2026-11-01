@@ -27,6 +27,7 @@ from .optimiser import OptimisationError
 HISTORY_PERIOD_SEARCH = "10y"
 WINDOW_WEEKS = BACKTEST_TRAIN_WEEKS
 BEAM_WIDTH = 5
+MIN_BACKTEST_WEEKS = 500
 MAX_NEW_LIMIT = 5
 BAND_ABSOLUTE = 0.05
 BAND_RELATIVE = 0.25
@@ -94,7 +95,8 @@ class BacktestFigures:
     max_drawdown: float
     baseline_sharpe: float
     baseline_max_drawdown: float
-    standard_error: float
+    standard_error: float  # annual, of the Sharpe difference (Memmel-corrected Jobson-Korkie)
+    correlation: float  # of the weekly out-of-sample returns of the finalist and the baseline
     weeks: int
 
 
@@ -223,12 +225,28 @@ def _sharpe(oos: pd.Series, risk_free: float) -> float:
     return analytics.sharpe_ratio(ret, risk_free, oos.std() * np.sqrt(PERIODS_PER_YEAR))
 
 
+def _sharpe_difference_se(oos: pd.Series, base: pd.Series, risk_free: float) -> tuple[float, float]:
+    """(annual standard error, correlation) of the difference of two Sharpe ratios on the same weeks.
+
+    Jobson-Korkie with Memmel's (2003) correction, on weekly Sharpe ratios s1, s2 and correlation rho:
+    Var = [2(1 - rho) + 0.5 (s1^2 + s2^2 - 2 s1 s2 rho^2)] / T. The annual standard error is sqrt(52 Var).
+    """
+    weekly_rf = risk_free / PERIODS_PER_YEAR
+    s1 = (oos.mean() - weekly_rf) / oos.std()
+    s2 = (base.mean() - weekly_rf) / base.std()
+    rho = float(oos.corr(base))
+    var = (2 * (1 - rho) + 0.5 * (s1**2 + s2**2 - 2 * s1 * s2 * rho**2)) / len(oos)
+    return float(np.sqrt(PERIODS_PER_YEAR * max(var, 0.0))), rho
+
+
 def _figures(oos: pd.Series, base: pd.Series, risk_free: float) -> tuple[BacktestFigures, str]:
+    if not oos.index.equals(base.index):
+        raise ValueError("The finalist and the baseline must be evaluated on the same weeks.")
     sr, sr_base = _sharpe(oos, risk_free), _sharpe(base, risk_free)
-    se = float(np.sqrt((1 + sr_base**2 / 2) / (len(oos) / PERIODS_PER_YEAR)))
-    status = FAILS if sr < sr_base - se else PASSES
+    se, rho = _sharpe_difference_se(oos, base, risk_free)
+    status = FAILS if sr - sr_base < -se else PASSES
     figures = BacktestFigures(
-        sr, analytics.max_drawdown(oos), sr_base, analytics.max_drawdown(base), se, len(oos)
+        sr, analytics.max_drawdown(oos), sr_base, analytics.max_drawdown(base), se, rho, len(oos)
     )
     return figures, status
 
@@ -261,16 +279,19 @@ def _without_covid(oos: pd.Series) -> pd.Series:
 
 
 def _backtest(
-    calendar: pd.DataFrame, held: list[str], props: pd.Series, adds: Sequence[str], mode: str,
-    baseline: pd.Series | None, risk_free: float, half_life: float, train: int, hold: int,
+    returns: pd.DataFrame, held: list[str], props: pd.Series, adds: Sequence[str], mode: str,
+    baselines: dict[int, pd.Series], risk_free: float, half_life: float, train: int, hold: int,
 ) -> Backtest:
-    assets = [*held, *adds]
-    short = [t for t in assets if calendar[t].isna().any()]
-    if short:
-        return Backtest(NO_BACKTEST, reason="Less than the full history for: " + ", ".join(short))
-    if len(calendar) <= train:
-        return Backtest(NO_BACKTEST, reason=f"Needs more than {train} weeks; {len(calendar)} available.")
-    oos = _walk_forward(calendar[assets], held, props, adds, mode, half_life, train, hold)
+    """Backtests on the weeks where every asset of the finalist has returns. The baseline is computed on those
+    same weeks; `baselines` caches it by window, since most finalists share one."""
+    window = data.common_window(returns, [*held, *adds])
+    if len(window) < MIN_BACKTEST_WEEKS:
+        return Backtest(NO_BACKTEST, reason=f"Common history is {len(window)} weeks; {MIN_BACKTEST_WEEKS} needed.")
+    key = hash(window.index.asi8.tobytes())
+    if key not in baselines:
+        baselines[key] = _baseline(window[held], held, props, mode, half_life, train, hold)
+    baseline = baselines[key]
+    oos = _walk_forward(window, held, props, adds, mode, half_life, train, hold)
     full, status = _figures(oos, baseline, risk_free)
     ex, status_ex = _figures(_without_covid(oos), _without_covid(baseline), risk_free)
     return Backtest(status, full, ex, status_ex, status != status_ex)
@@ -309,7 +330,6 @@ def search(
     props = _clean_holdings(holdings)
     held = list(props.index)
     window = returns.iloc[-WINDOW_WEEKS:]
-    calendar = returns.loc[returns.notna().any(axis=1)]
 
     for t in held:
         if t not in returns or window[t].isna().any():
@@ -365,23 +385,18 @@ def search(
             break
         beams.append(nxt)
 
-    base_baseline = None
-    if backtest and len(calendar) > WINDOW_WEEKS and not calendar[held].isna().any().any():
-        base_baseline = _baseline(
-            calendar[held], held, props, mode, half_life, WINDOW_WEEKS, BACKTEST_HOLD_WEEKS
-        )
-
+    baselines: dict[int, pd.Series] = {}
     finalists = []
     for chosen in beams[-1]:
         fit = _fit(frame, base, chosen.tickers, half_life)
         weights = _expand(fit, held, props, mode)
-        if base_baseline is None:
-            result = Backtest(NO_BACKTEST, reason="Backtest not available for the current holdings.")
-        else:
+        if backtest:
             result = _backtest(
-                calendar, held, props, chosen.tickers, mode, base_baseline, risk_free, half_life,
+                returns, held, props, chosen.tickers, mode, baselines, risk_free, half_life,
                 WINDOW_WEEKS, BACKTEST_HOLD_WEEKS,
             )
+        else:
+            result = Backtest(NO_BACKTEST, reason="Backtest not requested.")
         finalists.append(
             Finalist(
                 chosen.tickers, fit.ratio, fit.volatility, float(1 / (weights**2).sum()), weights,

@@ -247,15 +247,82 @@ def test_covid_figures_barely_move_without_a_crash():
     assert not bt.covid_sensitive or bt.status != bt.status_ex_covid
 
 
-def test_fails_when_sharpe_is_more_than_one_se_below_baseline():
+def test_standard_error_is_zero_for_identical_series():
+    x = pd.Series(np.random.default_rng(0).normal(0.004, 0.01, 300))
+    se, rho = search._sharpe_difference_se(x, x, 0.0)
+    assert rho == pytest.approx(1)
+    assert se == pytest.approx(0, abs=1e-6)  # sqrt turns rho = 1 - 2e-16 into ~1e-8
+
+
+def test_standard_error_matches_memmel_formula():
+    rng = np.random.default_rng(1)
+    base = pd.Series(rng.normal(0.004, 0.01, 300))
+    oos = 0.6 * base + pd.Series(rng.normal(0.003, 0.008, 300))
+    rf = 0.04
+    s1, s2 = (oos.mean() - rf / 52) / oos.std(), (base.mean() - rf / 52) / base.std()
+    rho = np.corrcoef(oos, base)[0, 1]
+    var = (2 * (1 - rho) + 0.5 * (s1**2 + s2**2 - 2 * s1 * s2 * rho**2)) / 300
+    se, got_rho = search._sharpe_difference_se(oos, base, rf)
+    assert se == pytest.approx(np.sqrt(52 * var))
+    assert got_rho == pytest.approx(rho)
+    figures, _ = search._figures(oos, base, rf)
+    assert figures.correlation == pytest.approx(rho) and figures.standard_error == pytest.approx(se)
+
+
+def test_planted_weekly_loss_fails_and_equal_series_passes():
     base = pd.Series(np.random.default_rng(0).normal(0.004, 0.01, 300))
-    bad = base - 0.02
-    figures, status = search._figures(bad, base, 0.0)
+    figures, status = search._figures(base - 0.002, base, 0.0)
     assert status == search.FAILS
-    figures, status = search._figures(base, base, 0.0)
-    assert status == search.PASSES
-    sr = figures.baseline_sharpe
-    assert figures.standard_error == pytest.approx(np.sqrt((1 + sr**2 / 2) / (300 / 52)))
+    assert search._figures(base, base, 0.0)[1] == search.PASSES
+
+
+def test_figures_require_the_same_weeks():
+    x = pd.Series(np.zeros(5) + np.arange(5) * 0.01, index=pd.date_range("2020-01-06", periods=5, freq="W-MON"))
+    with pytest.raises(ValueError, match="same weeks"):
+        search._figures(x, x.iloc[1:], 0.0)
+
+
+def statuses(res):
+    return {f.tickers: (f.backtest.status, f.backtest.status_ex_covid) for f in res.finalists}
+
+
+def test_unrelated_ticker_starting_a_week_earlier_changes_no_status():
+    r = make_returns()
+    plain = search.search(r, holdings(), candidates(r), max_new=1)
+    early = pd.DataFrame(np.nan, index=[r.index[0] - pd.Timedelta(weeks=1)], columns=r.columns)
+    wider = pd.concat([early, r])
+    wider["VOO"] = np.nan
+    wider.loc[wider.index[0], "VOO"] = 0.01
+    wider.loc[wider.index[1:], "VOO"] = np.random.default_rng(5).normal(0.002, 0.02, len(r))
+    res = search.search(wider, holdings(), candidates(r), max_new=1)
+    assert statuses(res) == statuses(plain)
+    assert all(s[0] != search.NO_BACKTEST for s in statuses(res).values())
+
+
+@pytest.mark.parametrize("weeks, expected", [(480, False), (510, True)])
+def test_backtest_needs_500_weeks_of_common_history(weeks, expected):
+    r = make_returns()
+    r.loc[r.index[:-weeks], "IND"] = np.nan
+    res = search.search(r, holdings(), ["IND"], max_new=1)
+    bt = res.finalists[0].backtest
+    assert (bt.status != search.NO_BACKTEST) is expected
+    assert (bt.full is not None) is expected
+    if expected:
+        assert bt.full.weeks == weeks - search.WINDOW_WEEKS
+    else:
+        assert "480" in bt.reason
+
+
+def test_baselines_are_cached_by_window():
+    r = make_returns()
+    props = holdings() / holdings().sum()
+    cache = {}
+    for add in ("C0", "C1", "C2"):
+        search._backtest(r, HELD, props, [add], "reweight", cache, 0.04, 52, 156, 13)
+    assert len(cache) == 1
+    r.loc[r.index[:50], "C3"] = np.nan
+    search._backtest(r, HELD, props, ["C3"], "reweight", cache, 0.04, 52, 156, 13)
+    assert len(cache) == 2
 
 
 def test_keep_mode_baseline_is_current_weights_held_fixed():
