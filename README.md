@@ -59,6 +59,7 @@ Tests use synthetic data and need no network access.
 | `optimiser.py` | cvxpy optimisers and efficient frontier. DPP problems built once per `Workspace` and reused across the 40 frontier points and backtest windows |
 | `weights.py` | Typed-weight parsing, normalisation, selection bookkeeping and largest-remainder display rounding |
 | `backtest.py` | Walk-forward backtest |
+| `search.py` | Finds stocks to add to a portfolio under risk parity: beam search on the diversification ratio (last 156 weeks, EWMA covariance), walk-forward backtest filter on 10 years, no-trade band. Has a Newton risk parity solver for the search loop. No Streamlit code |
 | `excel_io.py` | Excel export and import |
 | `sheet_builder.py` | Formula-driven workbook generator |
 | `charts.py` | Plotly figures |
