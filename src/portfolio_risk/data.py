@@ -1,6 +1,7 @@
 """Price download, caching, currency conversion and weekly return construction."""
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -59,20 +60,41 @@ def _download(ticker: str) -> tuple[pd.Series, str | None]:
     return close.astype(float), currency
 
 
-def _read_cache(ticker: str) -> tuple[pd.Series, str, bool] | None:
-    """(close prices, currency, is_fresh) from the parquet cache, or None when there is no file."""
+def _read_cache(ticker: str) -> tuple[pd.Series, str, bool, str] | None:
+    """(close prices, currency, is_fresh, currency_source) from the parquet cache, or None when there is no file.
+
+    currency_source is "metadata" or "guess". Files written before the column existed count as "guess".
+    """
     path = _cache_path(ticker)
     if not path.exists():
         return None
     frame = pd.read_parquet(path)
     fresh = (time.time() - path.stat().st_mtime) < CACHE_MAX_AGE_HOURS * 3600
-    return frame["close"], frame["currency"].iloc[0], fresh
+    source = frame["currency_source"].iloc[0] if "currency_source" in frame else "guess"
+    return frame["close"], frame["currency"].iloc[0], fresh, "metadata" if source == "metadata" else "guess"
 
 
-def _write_cache(ticker: str, close: pd.Series, currency: str) -> None:
+def _write_cache(ticker: str, close: pd.Series, currency: str, source: str, keep_mtime: bool = False) -> None:
+    """keep_mtime leaves the file's age alone when only the currency changed, so old prices do not look fresh."""
     path = _cache_path(ticker)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"close": close, "currency": currency}).to_parquet(path)
+    stamp = path.stat() if keep_mtime and path.exists() else None
+    pd.DataFrame({"close": close, "currency": currency, "currency_source": source}).to_parquet(path)
+    if stamp is not None:
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+
+
+def lookup_currency(ticker: str) -> str | None:
+    """Quote currency from Yahoo metadata, or None when neither source answers."""
+    tk = yf.Ticker(ticker)
+    for read in (lambda: tk.fast_info["currency"], lambda: tk.get_history_metadata().get("currency")):
+        try:
+            currency = read()
+        except Exception:
+            continue
+        if isinstance(currency, str) and currency:
+            return currency
+    return None
 
 
 def fetch_prices(ticker: str) -> tuple[pd.Series, str, bool]:
@@ -86,8 +108,9 @@ def fetch_prices(ticker: str) -> tuple[pd.Series, str, bool]:
         if cached is not None:
             return cached[0], cached[1], True
         raise
+    source = "metadata" if currency else "guess"
     currency = currency or default_currency(ticker)
-    _write_cache(ticker, close, currency)
+    _write_cache(ticker, close, currency, source)
     return close, currency, False
 
 
@@ -128,12 +151,20 @@ def convert_to_usd(prices: pd.Series, fx: pd.Series) -> pd.Series:
     return prices * aligned
 
 
+def ffill_within_range(prices: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fills each column up to its own last valid date. A trailing gap stays NaN."""
+    ended = prices.notna().iloc[::-1].cummax().iloc[::-1]
+    return prices.ffill().where(ended)
+
+
 def build_returns(prices: pd.DataFrame) -> pd.DataFrame:
     """Forward-fills holiday gaps on a shared calendar, then takes percentage changes.
 
     Rows are deliberately not dropped first: that would turn holiday weeks into two-week returns.
+    A series is filled only up to its own last valid date, so one that ended early has NaN returns after it
+    (common_window then ends the shared window there) instead of flat prices and zero returns.
     """
-    filled = prices.sort_index().ffill()
+    filled = ffill_within_range(prices.sort_index())
     return filled.pct_change(fill_method=None)
 
 
@@ -150,33 +181,44 @@ def _known_currency(ticker: str) -> str:
 def _collect(
     wanted: list[str], max_workers: int, note: Callable[[str], None]
 ) -> tuple[dict[str, tuple[pd.Series, str]], dict[str, str], list[str]]:
-    """Fresh disk cache first, then one batched download for the rest, then per-ticker calls for the leftovers."""
+    """Fresh disk cache first, then one batched download for the rest, then per-ticker calls for the leftovers.
+
+    Currencies not yet confirmed by Yahoo metadata (batch downloads, cache files marked "guess") are looked up
+    in the same thread pool as the per-ticker calls.
+    """
     results: dict[str, tuple[pd.Series, str]] = {}
     failures: dict[str, str] = {}
     stale: list[str] = []
     todo = []
+    unconfirmed: dict[str, pd.Series] = {}  # fresh cache files whose currency is only a guess
     for t in wanted:
         cached = _read_cache(t)
         if cached is not None and cached[2]:
             results[t] = (cached[0], cached[1])
+            if cached[3] != "metadata" and not t.endswith("=X"):
+                unconfirmed[t] = cached[0]
         else:
             todo.append(t)
     note(f"{len(results)} of {len(wanted)} tickers read from the disk cache.")
-    if not todo:
+    if not todo and not unconfirmed:
         return results, failures, stale
 
-    note(f"Downloading {len(todo)} tickers in one batch…")
-    try:
-        batch = download_batch(todo)
-    except Exception as exc:
-        note(f"Batch download failed ({exc}); falling back to one call per ticker.")
-        batch = {}
-    for t, close in batch.items():
-        currency = _known_currency(t)
-        _write_cache(t, close, currency)
-        results[t] = (close, currency)
+    batch: dict[str, pd.Series] = {}
+    if todo:
+        note(f"Downloading {len(todo)} tickers in one batch…")
+        try:
+            batch = download_batch(todo)
+        except Exception as exc:
+            note(f"Batch download failed ({exc}); falling back to one call per ticker.")
+        note(f"Batch returned {len(batch)} of {len(todo)} tickers.")
     missing = [t for t in todo if t not in batch]
-    note(f"Batch returned {len(batch)} of {len(todo)} tickers.")
+
+    known: dict[str, str] = {}  # batch tickers with a metadata currency already on disk
+    for t in batch:
+        cached = _read_cache(t)
+        if cached is not None and cached[3] == "metadata":
+            known[t] = cached[1]
+    to_look_up = [*unconfirmed, *(t for t in batch if t not in known and not t.endswith("=X"))]
 
     def work(t: str):
         try:
@@ -184,17 +226,43 @@ def _collect(
         except Exception as exc:
             return t, None, str(exc) or type(exc).__name__
 
+    def look_up(t: str):
+        try:
+            return lookup_currency(t)
+        except Exception:
+            return None
+
     if missing:
         note("Per-ticker fallback for: " + ", ".join(missing))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for t, res, err in pool.map(work, missing):
-                if err is not None:
-                    failures[t] = err
-                    continue
-                series, currency, was_stale = res
-                results[t] = (series, currency)
-                if was_stale:
-                    stale.append(t)
+    if to_look_up:
+        note("Looking up the currency of: " + ", ".join(to_look_up))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending_lookups = pool.map(look_up, to_look_up)
+        pending_fetches = pool.map(work, missing)
+        lookups, fetched = list(pending_lookups), list(pending_fetches)
+    looked_up = dict(zip(to_look_up, lookups))
+
+    for t, close in batch.items():
+        if t in known:
+            currency, source = known[t], "metadata"
+        elif looked_up.get(t):
+            currency, source = looked_up[t], "metadata"
+        else:
+            currency, source = default_currency(t), "guess"
+        _write_cache(t, close, currency, source)
+        results[t] = (close, currency)
+    for t, close in unconfirmed.items():
+        if looked_up.get(t):
+            _write_cache(t, close, looked_up[t], "metadata", keep_mtime=True)
+            results[t] = (close, looked_up[t])
+    for t, res, err in fetched:
+        if err is not None:
+            failures[t] = err
+            continue
+        series, currency, was_stale = res
+        results[t] = (series, currency)
+        if was_stale:
+            stale.append(t)
     return results, failures, stale
 
 
@@ -240,7 +308,7 @@ def load_market_data(
     }
     if not usd:
         return MarketData(pd.DataFrame(), currencies, failures, stale, log=log)
-    prices = pd.DataFrame(usd).sort_index().ffill()
+    prices = ffill_within_range(pd.DataFrame(usd).sort_index())
     return MarketData(build_returns(prices), {t: currencies[t] for t in usd}, failures, stale, prices, log)
 
 
