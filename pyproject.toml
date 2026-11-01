@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfolio-risk"
+version = "0.1.0"
+description = "Streamlit app that estimates portfolio risk and return and recommends optimised weights"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "streamlit",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "cvxpy",
+    "plotly",
+    "yfinance",
+    "pyarrow",
+    "lxml",
+    "requests",
+    "openpyxl",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
