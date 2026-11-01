@@ -71,6 +71,6 @@ Tests use synthetic data and need no network access.
 | `charts.py` | Plotly figures |
 | `ui.py` | Streamlit interface. Estimates are cached on tickers and settings; the weight table and tabs run in one fragment |
 
-Prices are cached in `.cache/` (override with `PORTFOLIO_RISK_CACHE`) and refreshed after 24 hours.
+Prices are cached in `.cache/` (override with `PORTFOLIO_RISK_CACHE`) and refreshed after 24 hours. Each file records whether its currency came from Yahoo metadata or from the `.SI` suffix guess; guessed currencies are looked up again on every load. Prices are forward-filled across holiday gaps only up to a series' last date, so a ticker whose data ends early shortens the common window instead of showing flat prices.
 
 Results are historical and are not financial advice.
