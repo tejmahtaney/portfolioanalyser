@@ -165,3 +165,62 @@ def test_failed_currency_lookup_falls_back_to_the_suffix_guess(monkeypatch, tmp_
     again = data.load_market_data(["J36.SI"])  # a guess on disk is retried, and failing again does not block
     assert again.currencies["J36.SI"] == "SGD"
     assert not again.returns.empty
+
+
+class SeriesYahoo(FakeYahoo):
+    """FakeYahoo with caller-supplied close series, so bar dates can be chosen per ticker. All quoted in USD."""
+
+    def __init__(self, monkeypatch, tmp_path, series):
+        super().__init__(monkeypatch, tmp_path, {t: "USD" for t in series})
+        self.series = series
+
+    def download(self, tickers, **kwargs):
+        self.downloaded.extend(tickers)
+        return pd.concat({t: pd.DataFrame({"Close": self.series[t]}) for t in tickers}, axis=1, sort=True)
+
+
+def dated(values, start, freq="W-MON"):
+    return pd.Series(values, index=pd.date_range(start, periods=len(values), freq=freq), dtype=float)
+
+
+def test_thursday_dated_bars_line_up_with_monday_dated_bars(monkeypatch, tmp_path):
+    values = np.linspace(100, 120, 12)
+    SeriesYahoo(monkeypatch, tmp_path, {"VOO": dated(values, "2024-01-01"), "A": dated(values * 2, "2024-01-01"),
+                                        "NEW": dated(values / 2, "2024-01-04", "W-THU")})
+    md = data.load_market_data(["A", "NEW"])
+    assert len(md.prices) == 12
+    assert (md.prices.index.day_of_week == 0).all()
+    assert md.returns.iloc[1:].notna().all().all()
+    assert (md.returns.iloc[1:] != 0).all().all()
+    assert len(data.common_window(md.returns, ["A", "NEW"])) == 11
+
+
+def test_partial_final_week_dated_mid_week_lines_up_with_the_other_tickers(monkeypatch, tmp_path):
+    full = dated(np.linspace(100, 120, 12), "2024-01-01")
+    partial = full.copy()
+    partial.index = [*partial.index[:-1], partial.index[-1] + pd.Timedelta(days=3)]  # last bar dated Thursday
+    SeriesYahoo(monkeypatch, tmp_path, {"VOO": full, "A": partial})
+    md = data.load_market_data(["A"])
+    assert list(md.prices.index) == list(full.index)
+    assert md.returns["A"].iloc[-1] == pytest.approx(full.iloc[-1] / full.iloc[-2] - 1)
+
+
+def test_two_bars_in_the_same_week_keep_the_later_one():
+    bars = pd.Series([1.0, 2.0, 3.0], index=pd.to_datetime(["2024-01-02", "2024-01-04", "2024-01-09"]))
+    out = data.snap_to_monday(bars)
+    assert list(out.index) == list(pd.to_datetime(["2024-01-01", "2024-01-08"]))
+    assert list(out) == [2.0, 3.0]
+    shuffled = data.snap_to_monday(bars.iloc[::-1])  # order of arrival does not matter, the later date wins
+    assert list(shuffled) == [2.0, 3.0]
+
+
+def test_old_cache_files_with_mid_week_dates_are_normalised_on_read(monkeypatch, tmp_path):
+    SeriesYahoo(monkeypatch, tmp_path, {"VOO": dated(np.linspace(1, 2, 12), "2024-01-01"), "A": dated(np.linspace(1, 2, 12), "2024-01-01")})
+    path = data._cache_path("A")
+    path.parent.mkdir(parents=True)
+    old = dated(np.linspace(10, 12, 12), "2024-01-04", "W-THU")
+    pd.DataFrame({"close": old, "currency": "USD", "currency_source": "metadata"}).to_parquet(path)
+    close, _, fresh, _ = data._read_cache("A")
+    assert fresh
+    assert (close.index.day_of_week == 0).all()
+    assert list(close) == list(old)

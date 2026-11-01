@@ -46,7 +46,7 @@ Builds a workbook whose analytics are live formulas, so it can be used in Excel,
 python -m portfolio_risk.sheet_builder -o portfolio.xlsx VOO:10 NVDA:5 D05.SI:20 GC=F:15 BND:50
 ```
 
-Arguments are `TICKER:WEIGHT` pairs, weights in percent. Prices are written as values (USD, weekly, forward-filled, common window); weights, risk-free rate and shrinkage stay editable in the `Inputs` sheet. The sheet covers returns, covariance (sample only), correlation, beta, risk contributions, drawdown, VaR and data quality. Optimisation is a Solver-ready trial portfolio on the `Optimiser` sheet. Ledoit-Wolf, risk parity, the efficient frontier and the backtest are not in the sheet.
+Arguments are `TICKER:WEIGHT` pairs, weights in percent. Prices are written as values (USD, weekly with every bar dated to the Monday of its week, forward-filled, common window); weights, risk-free rate and shrinkage stay editable in the `Inputs` sheet. The sheet covers returns, covariance (sample only), correlation, beta, risk contributions, drawdown, VaR and data quality. Optimisation is a Solver-ready trial portfolio on the `Optimiser` sheet. Ledoit-Wolf, risk parity, the efficient frontier and the backtest are not in the sheet.
 
 ## Test
 
@@ -61,7 +61,7 @@ Tests use synthetic data and need no network access.
 | Module | Concern |
 | --- | --- |
 | `universe.py` | Asset universe. Add entries to `STI`, `INDEX_FUNDS` or `FUTURES`; S&P 500 is scraped from Wikipedia |
-| `data.py` | One batched yfinance download for tickers missing from the parquet cache (per-ticker fallback), USD conversion, weekly returns, data-quality checks |
+| `data.py` | One batched yfinance download for tickers missing from the parquet cache (per-ticker fallback), USD conversion, weekly returns (bar dates snapped to Monday), data-quality checks |
 | `analytics.py` | Covariance, expected returns, beta, risk contribution, drawdown, VaR |
 | `optimiser.py` | cvxpy optimisers and efficient frontier. DPP problems built once per `Workspace` and reused across the 40 frontier points and backtest windows |
 | `weights.py` | Typed-weight parsing, normalisation, selection bookkeeping and largest-remainder display rounding |

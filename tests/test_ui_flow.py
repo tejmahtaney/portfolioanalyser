@@ -265,6 +265,28 @@ def test_zero_weight_ticker_with_shorter_history_leaves_portfolio_metrics_unchan
     assert any("Frontier, Recommendations and Backtest tabs use the shared window" in c.value for c in at.caption)
 
 
+def test_zero_weight_ticker_with_thursday_dated_bars_leaves_portfolio_metrics_unchanged(returns, monkeypatch, tmp_path):
+    from test_data import SeriesYahoo
+
+    st.cache_data.clear()
+    monday = {t: pd.Series((1 + returns[t]).cumprod().to_numpy() * 100, index=returns.index) for t in ["VOO", "A", "B"]}
+    thursday = pd.Series(np.linspace(50, 80, len(returns)), index=returns.index + pd.Timedelta(days=3))
+    SeriesYahoo(monkeypatch, tmp_path, {**monday, "NEW": thursday})
+    frame = pd.DataFrame({"ticker": ["VOO", "A", "B", "NEW"], "name": "n", "asset_class": "Index fund"})
+    monkeypatch.setattr(universe, "load_universe", lambda: (frame, None))
+
+    at = launch(["A", "B"])
+    edit(at, {0: 50.0, 1: 50.0})
+    before = portfolio_metrics(at)
+    assert before["Expected return"] != "n/a"
+    add_ticker(at, "NEW")
+    assert at.session_state["weights"]["NEW"] == 0.0
+    after = portfolio_metrics(at)
+    assert after == before
+    assert metric(at, "Sharpe ratio") == before["Sharpe ratio"]
+    st.cache_data.clear()
+
+
 def test_portfolio_tab_states_the_weeks_and_range_used_for_held_assets(calls, returns):
     returns.loc[returns.index[:200], "D"] = np.nan
     at = launch(["A", "B", "C", "D"])
