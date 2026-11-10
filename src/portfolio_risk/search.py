@@ -1,8 +1,13 @@
-"""Search for new stocks to add to a portfolio under risk parity.
+"""Search for new stocks to add to a portfolio.
 
-Stage 1 is a beam search on the diversification ratio of the risk parity portfolio of holdings plus additions,
-estimated on the last WINDOW_WEEKS weeks with an EWMA covariance. Stage 2 runs a walk-forward backtest over the
-full history for each finalist and compares its out-of-sample Sharpe ratio with a baseline that has no additions.
+Stage 1 is a beam search over additions held at a fixed small slice each (SLICE), with the holdings scaled down in
+proportion. A candidate that raises the portfolio's CVaR is dropped. A set is ranked by the mean of its ranks on
+the change in volatility, the change in CVaR and the correlation of the additions with the holdings, over the last
+WINDOW_WEEKS weeks. The finalists are then sized in one of three ways: each addition at SLICE (the default, or the
+largest input position when that is smaller); by risk parity with an EWMA covariance; or "balanced", risk parity
+blended with the max Sharpe weights. The last two can cap every position at the largest input position. Stage 2 runs
+a walk-forward backtest over the full history for each finalist and compares its out-of-sample Sharpe ratio with a
+baseline that has no additions.
 
 Weights are fractions that sum to 1. Nothing here imports Streamlit.
 """
@@ -22,19 +27,25 @@ from .config import (
     EWMA_HALF_LIFE_WEEKS,
     PERIODS_PER_YEAR,
 )
+from . import optimiser
 from .optimiser import OptimisationError
 
 HISTORY_PERIOD_SEARCH = "10y"
 WINDOW_WEEKS = BACKTEST_TRAIN_WEEKS
+MAX_TRIM_WEEKS = 2
 BEAM_WIDTH = 5
 MIN_BACKTEST_WEEKS = 500
-MAX_NEW_LIMIT = 5
+MAX_NEW_LIMIT = 10
 BAND_ABSOLUTE = 0.05
 BAND_RELATIVE = 0.25
 COVID_START = pd.Timestamp("2020-02-01")
 COVID_END = pd.Timestamp("2020-04-30")
 MODES = ("reweight", "keep")
+SIZINGS = ("slice", "risk_parity", "balanced")
+DEFAULT_TILT = 0.5  # share of max Sharpe in balanced sizing
 BLOCK = "current holdings"
+SLICE = 0.05  # weight of each addition while ranking, and in the recommendation under slice sizing
+CVAR_LEVEL = 0.10  # share of the worst weeks averaged for CVaR
 
 PASSES, FAILS, NO_BACKTEST = "passes", "fails", "no backtest"
 
@@ -80,13 +91,58 @@ def risk_parity_weights(cov: np.ndarray) -> np.ndarray:
     raise OptimisationError("Risk parity: the Newton solver did not converge.")
 
 
+def capped_risk_parity_weights(cov: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Risk parity with w_i <= upper_i. An asset above its bound is held at the bound and the rest are
+    re-solved on what remains, repeating until none is over. No asset is dropped: every free asset keeps a
+    positive weight."""
+    n = len(cov)
+    if upper.sum() < 1 - 1e-12:
+        raise OptimisationError("The position cap leaves the weights unable to sum to 100%.")
+    w = risk_parity_weights(cov)
+    free = np.ones(n, bool)
+    while True:
+        over = free & (w > upper + 1e-12)
+        if not over.any():
+            return w
+        free &= ~over
+        fixed = ~free
+        w = np.where(fixed, upper, 0.0)
+        if free.any():
+            w[free] = risk_parity_weights(cov[np.ix_(free, free)]) * (1.0 - upper[fixed].sum())
+
+
+def cap_weights(w: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Holds any weight above its bound at the bound and spreads the excess over the others in proportion."""
+    w = w.copy()
+    free = np.ones(len(w), bool)
+    while True:
+        over = free & (w > upper + 1e-12)
+        if not over.any():
+            return w
+        free &= ~over
+        w[over] = upper[over]
+        if not free.any() or w[free].sum() <= 0:
+            return w
+        w[free] *= (1.0 - w[~free].sum()) / w[free].sum()
+
+
 # --- Result types --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Metrics:
+    """Effect of adding the tickers at SLICE each, against the holdings alone. Lower is better for all three."""
+
+    d_volatility: float  # annual
+    d_cvar: float  # weekly loss, positive is worse
+    correlation: float  # weekly returns of the additions with those of the holdings
 
 
 @dataclass(frozen=True)
 class ScoredSet:
     tickers: tuple[str, ...]  # sorted
-    ratio: float  # diversification ratio
+    metrics: Metrics
+    score: float  # mean rank over the sets scored together, lower is better
 
 
 @dataclass
@@ -113,6 +169,8 @@ class Backtest:
 @dataclass
 class Finalist:
     tickers: tuple[str, ...]
+    metrics: Metrics
+    score: float
     diversification_ratio: float
     volatility: float
     effective_assets: float
@@ -123,11 +181,12 @@ class Finalist:
 
 @dataclass
 class SearchResult:
-    finalists: list[Finalist]  # ordered by diversification ratio, best first
+    finalists: list[Finalist]  # ordered by score, best first
     best_by_depth: dict[int, ScoredSet]  # best set at each depth below the final one
     depth: int  # size of the finalist sets; below max_new when the search stopped early
     holdings_ratio: float  # diversification ratio of the holdings alone, for reference
     excluded: dict[str, str] = field(default_factory=dict)
+    trimmed_weeks: int = 0  # trailing weeks dropped because a holding had no bar yet
 
 
 Progress = Callable[[int, int, ScoredSet], None]  # depth, max_new, best set at that depth
@@ -158,6 +217,22 @@ def _clean_holdings(holdings: pd.Series) -> pd.Series:
     return analytics.normalise_weights(held)
 
 
+def _trim_incomplete_tail(returns: pd.DataFrame, held: list[str]) -> tuple[pd.DataFrame, int]:
+    """Drops up to MAX_TRIM_WEEKS trailing weeks in which a holding has no return yet.
+
+    The calendar is shared with futures and FX, which can have the current week's bar before equities do.
+    A longer gap is left alone so that a stalled holding still fails the completeness check.
+    """
+    present = [t for t in held if t in returns]
+    if not present:
+        return returns, 0
+    complete = returns[present].notna().all(axis=1).to_numpy().nonzero()[0]
+    trailing = len(returns) - 1 - int(complete[-1]) if len(complete) else 0
+    if not 0 < trailing <= MAX_TRIM_WEEKS:
+        return returns, 0
+    return returns.iloc[:-trailing], trailing
+
+
 # --- Estimation ----------------------------------------------------------------------------------------------
 
 
@@ -169,6 +244,16 @@ def _frame(window: pd.DataFrame, held: list[str], props: pd.Series, mode: str) -
     if mode == "reweight":
         return window, held
     return window.assign(**{BLOCK: window[held] @ props[held]}), [BLOCK]
+
+
+@dataclass(frozen=True)
+class Sizing:
+    """cap: largest weight any single stock may take. tilt: share of the max Sharpe weights in the blend with risk
+    parity (0 is pure risk parity). risk_free: for the max Sharpe weights."""
+
+    cap: float = 1.0
+    tilt: float = 0.0
+    risk_free: float = DEFAULT_RISK_FREE
 
 
 @dataclass
@@ -186,10 +271,25 @@ class _Fit:
         return float(np.sqrt(self.w @ self.cov @ self.w))
 
 
-def _fit(frame: pd.DataFrame, base: list[str], adds: Sequence[str], half_life: float) -> _Fit:
+def _fit(
+    frame: pd.DataFrame, base: list[str], adds: Sequence[str], half_life: float, sizing: Sizing = Sizing()
+) -> _Fit:
+    """Risk parity weights, blended with max Sharpe weights when sizing.tilt > 0 (kept as risk parity when no
+    portfolio beats the risk-free rate). The keep-mode block is a share of the holdings, which already sit at or
+    under a cap set from them, so it is bounded by 1."""
     labels = [*base, *adds]
-    cov = analytics.annual_covariance(frame[labels], "ewma", half_life).to_numpy()
-    return _Fit(labels, cov, risk_parity_weights(cov))
+    cov_df = analytics.annual_covariance(frame[labels], "ewma", half_life)
+    cov = cov_df.to_numpy()
+    upper = np.array([1.0 if label == BLOCK else sizing.cap for label in labels])
+    w = capped_risk_parity_weights(cov, upper)
+    if sizing.tilt > 0:
+        mu = analytics.expected_returns(frame[labels])
+        try:
+            sharpe_w = optimiser.max_sharpe(mu, cov_df, sizing.risk_free, None).weights.to_numpy()
+        except OptimisationError:
+            return _Fit(labels, cov, w)
+        w = cap_weights((1 - sizing.tilt) * w + sizing.tilt * sharpe_w, upper)
+    return _Fit(labels, cov, w)
 
 
 def _expand(fit: _Fit, held: list[str], props: pd.Series, mode: str) -> pd.Series:
@@ -199,6 +299,52 @@ def _expand(fit: _Fit, held: list[str], props: pd.Series, mode: str) -> pd.Serie
         return w
     block = w.pop(BLOCK)
     return pd.concat([block * props[held], w])
+
+
+def _cvar(returns: np.ndarray) -> float:
+    worst = max(1, int(np.ceil(CVAR_LEVEL * len(returns))))
+    return float(-np.sort(returns)[:worst].mean())
+
+
+def _slice_size(props: pd.Series) -> float:
+    """Weight of each addition: SLICE, or the largest input position when that is smaller."""
+    return min(SLICE, float(props.max()))
+
+
+def _slice_returns(hold: pd.Series, panel: pd.DataFrame, adds: Sequence[str], size: float) -> pd.Series:
+    """Weekly returns of the holdings scaled to 1 - size * len(adds), with each addition at `size`."""
+    return hold * (1 - size * len(adds)) + size * panel[list(adds)].sum(axis=1)
+
+
+def _slice_weights(props: pd.Series, adds: Sequence[str], size: float) -> pd.Series:
+    return pd.concat([props * (1 - size * len(adds)), pd.Series(size, index=list(adds))])
+
+
+def _stats(window: pd.DataFrame, weights: pd.Series, half_life: float) -> tuple[float, float]:
+    """(diversification ratio, volatility) of fixed weights under the EWMA covariance."""
+    cov = analytics.annual_covariance(window[list(weights.index)], "ewma", half_life).to_numpy()
+    w = weights.to_numpy()
+    vol = float(np.sqrt(w @ cov @ w))
+    return float(w @ np.sqrt(np.diag(cov)) / vol), vol
+
+
+def _set_metrics(window: pd.DataFrame, hold: pd.Series, adds: tuple[str, ...], size: float) -> Metrics:
+    """Metrics of the holdings plus the additions at `size` each, against the holdings alone. `hold` is the weekly
+    return of the holdings at their current proportions."""
+    sleeve = window[list(adds)].sum(axis=1).to_numpy()
+    h = hold.to_numpy()
+    p = _slice_returns(hold, window, adds, size).to_numpy()
+    d_vol = (p.std(ddof=1) - h.std(ddof=1)) * np.sqrt(PERIODS_PER_YEAR)
+    return Metrics(float(d_vol), _cvar(p) - _cvar(h), float(np.corrcoef(h, sleeve)[0, 1]))
+
+
+def _rank(sets: Iterable[tuple[tuple[str, ...], Metrics]]) -> list[ScoredSet]:
+    """Orders sets by the mean of their ranks on the three metrics, best first."""
+    sets = list(sets)
+    table = pd.DataFrame([[m.d_volatility, m.d_cvar, m.correlation] for _, m in sets])
+    scores = table.rank(method="average").mean(axis=1)
+    scored = [ScoredSet(tickers, m, float(sc)) for (tickers, m), sc in zip(sets, scores)]
+    return sorted(scored, key=lambda x: (x.score, x.tickers))
 
 
 # --- Band ----------------------------------------------------------------------------------------------------
@@ -253,25 +399,26 @@ def _figures(oos: pd.Series, base: pd.Series, risk_free: float) -> tuple[Backtes
 
 def _walk_forward(
     panel: pd.DataFrame, held: list[str], props: pd.Series, adds: Sequence[str], mode: str, half_life: float,
-    train: int, hold: int,
+    train: int, hold: int, sizing: Sizing = Sizing(),
 ) -> pd.Series:
     """Out-of-sample weekly returns of risk parity over holdings plus `adds`, refitted every `hold` weeks."""
     frame, base = _frame(panel, held, props, mode)
     parts = []
     for start in range(train, len(panel), hold):
-        fit = _fit(frame.iloc[start - train : start], base, adds, half_life)
+        fit = _fit(frame.iloc[start - train : start], base, adds, half_life, sizing)
         w = _expand(fit, held, props, mode)
         parts.append(panel.iloc[start : start + hold][w.index] @ w)
     return pd.concat(parts)
 
 
 def _baseline(
-    panel: pd.DataFrame, held: list[str], props: pd.Series, mode: str, half_life: float, train: int, hold: int
+    panel: pd.DataFrame, held: list[str], props: pd.Series, mode: str, half_life: float, train: int, hold: int,
+    sizing: Sizing = Sizing(),
 ) -> pd.Series:
     """Keep mode: the current weights held fixed. Reweight mode: risk parity on the holdings alone."""
     if mode == "keep":
         return (panel[held] @ props[held]).iloc[train:]
-    return _walk_forward(panel, held, props, [], mode, half_life, train, hold)
+    return _walk_forward(panel, held, props, [], mode, half_life, train, hold, sizing)
 
 
 def _without_covid(oos: pd.Series) -> pd.Series:
@@ -281,6 +428,7 @@ def _without_covid(oos: pd.Series) -> pd.Series:
 def _backtest(
     returns: pd.DataFrame, held: list[str], props: pd.Series, adds: Sequence[str], mode: str,
     baselines: dict[int, pd.Series], risk_free: float, half_life: float, train: int, hold: int,
+    sizing: str = "risk_parity", fit_sizing: Sizing = Sizing(),
 ) -> Backtest:
     """Backtests on the weeks where every asset of the finalist has returns. The baseline is computed on those
     same weeks; `baselines` caches it by window, since most finalists share one."""
@@ -288,10 +436,16 @@ def _backtest(
     if len(window) < MIN_BACKTEST_WEEKS:
         return Backtest(NO_BACKTEST, reason=f"Common history is {len(window)} weeks; {MIN_BACKTEST_WEEKS} needed.")
     key = hash(window.index.asi8.tobytes())
-    if key not in baselines:
-        baselines[key] = _baseline(window[held], held, props, mode, half_life, train, hold)
-    baseline = baselines[key]
-    oos = _walk_forward(window, held, props, adds, mode, half_life, train, hold)
+    if sizing == "slice":
+        if key not in baselines:
+            baselines[key] = _baseline(window[held], held, props, "keep", half_life, train, hold)
+        baseline = baselines[key]
+        oos = _slice_returns(window[held] @ props[held], window, adds, _slice_size(props)).iloc[train:]
+    else:
+        if key not in baselines:
+            baselines[key] = _baseline(window[held], held, props, mode, half_life, train, hold, fit_sizing)
+        baseline = baselines[key]
+        oos = _walk_forward(window, held, props, adds, mode, half_life, train, hold, fit_sizing)
     full, status = _figures(oos, baseline, risk_free)
     ex, status_ex = _figures(_without_covid(oos), _without_covid(baseline), risk_free)
     return Backtest(status, full, ex, status_ex, status != status_ex)
@@ -306,6 +460,9 @@ def search(
     candidates: Iterable[str],
     max_new: int = 3,
     mode: str = "reweight",
+    sizing: str = "slice",
+    cap_positions: bool = False,
+    tilt: float = DEFAULT_TILT,
     absolute_band: float = BAND_ABSOLUTE,
     relative_band: float = BAND_RELATIVE,
     beam_width: int = BEAM_WIDTH,
@@ -315,7 +472,7 @@ def search(
     progress: Progress | None = None,
     backtest: bool = True,
 ) -> SearchResult:
-    """Finds the sets of up to `max_new` new tickers that make the risk parity portfolio most diversified.
+    """Finds the sets of up to `max_new` new tickers that most improve the holdings, then sizes them by risk parity.
 
     returns: weekly returns, ten years for the backtest. holdings: weights as from excel_io.import_weights (any
     scale; normalised here). unavailable: tickers that could not be loaded, with reasons (load_history).
@@ -324,11 +481,16 @@ def search(
         raise ValueError(f"max_new must be between 1 and {MAX_NEW_LIMIT}.")
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}.")
-    if len(returns) < WINDOW_WEEKS:
-        raise ValueError(f"The search needs {WINDOW_WEEKS} weeks of returns; {len(returns)} available.")
+    if sizing not in SIZINGS:
+        raise ValueError(f"sizing must be one of {SIZINGS}.")
+    if not 0 <= tilt <= 1:
+        raise ValueError("tilt must be between 0 and 1.")
 
     props = _clean_holdings(holdings)
     held = list(props.index)
+    returns, trimmed = _trim_incomplete_tail(returns, held)
+    if len(returns) < WINDOW_WEEKS:
+        raise ValueError(f"The search needs {WINDOW_WEEKS} weeks of returns; {len(returns)} available.")
     window = returns.iloc[-WINDOW_WEEKS:]
 
     for t in held:
@@ -353,19 +515,28 @@ def search(
             eligible.append(t)
     if not eligible:
         raise ValueError("No candidate has enough history to be tested.")
-    eligible.sort()
+    hold = window[held] @ props[held]
+    size = _slice_size(props)
+    passed = []
+    for t in sorted(eligible):
+        if _set_metrics(window, hold, (t,), size).d_cvar > 0:
+            excluded[t] = f"Raises the portfolio's CVaR at a {size:.0%} position."
+        else:
+            passed.append(t)
+    if not passed:
+        raise ValueError(f"No candidate lowers the portfolio's CVaR at a {size:.0%} position.")
+    eligible = passed
     max_new = min(max_new, len(eligible))
 
     frame, base = _frame(window, held, props, mode)
+    fit_sizing = Sizing(  # risk parity and balanced sizing only
+        float(props.max()) if cap_positions else 1.0, tilt if sizing == "balanced" else 0.0, risk_free
+    )
 
-    def score(adds: Iterable[str]) -> ScoredSet:
-        adds = tuple(sorted(adds))
-        return ScoredSet(adds, _fit(frame, base, adds, half_life).ratio)
+    def best(keys: Iterable[tuple[str, ...]]) -> list[ScoredSet]:
+        return _rank((k, _set_metrics(window, hold, k, size)) for k in keys)[:beam_width]
 
-    def best(sets: Iterable[ScoredSet]) -> list[ScoredSet]:
-        return sorted(sets, key=lambda s: (-s.ratio, s.tickers))[:beam_width]
-
-    beams = [best(score([c]) for c in eligible)]
+    beams = [best((c,) for c in eligible)]
     if progress:
         progress(1, max_new, beams[0][0])
     for depth in range(2, max_new + 1):
@@ -377,33 +548,39 @@ def search(
                 if c in kept.tickers or key in seen:
                     continue
                 seen.add(key)
-                scored.append(score(key))
+                scored.append(key)
         nxt = best(scored)
         if progress:
             progress(depth, max_new, nxt[0])
-        if nxt[0].ratio <= beams[-1][0].ratio:  # no extension raised the best score
+        if nxt[0].metrics.d_volatility >= beams[-1][0].metrics.d_volatility:  # no extension lowered volatility
             break
         beams.append(nxt)
 
     baselines: dict[int, pd.Series] = {}
     finalists = []
     for chosen in beams[-1]:
-        fit = _fit(frame, base, chosen.tickers, half_life)
-        weights = _expand(fit, held, props, mode)
+        if sizing == "slice":
+            weights = _slice_weights(props, chosen.tickers, size)
+            ratio, volatility = _stats(window, weights, half_life)
+        else:
+            fit = _fit(frame, base, chosen.tickers, half_life, fit_sizing)
+            weights = _expand(fit, held, props, mode)
+            ratio, volatility = fit.ratio, fit.volatility
         if backtest:
             result = _backtest(
                 returns, held, props, chosen.tickers, mode, baselines, risk_free, half_life,
-                WINDOW_WEEKS, BACKTEST_HOLD_WEEKS,
+                WINDOW_WEEKS, BACKTEST_HOLD_WEEKS, sizing, fit_sizing,
             )
         else:
             result = Backtest(NO_BACKTEST, reason="Backtest not requested.")
         finalists.append(
             Finalist(
-                chosen.tickers, fit.ratio, fit.volatility, float(1 / (weights**2).sum()), weights,
+                chosen.tickers, chosen.metrics, chosen.score, ratio, volatility,
+                float(1 / (weights**2).sum()), weights,
                 trade_table(weights, props, absolute_band, relative_band), result,
             )
         )
-    holdings_ratio = _fit(frame, base, (), half_life).ratio
+    holdings_ratio = _fit(frame, base, (), half_life, Sizing(fit_sizing.cap)).ratio
     return SearchResult(
-        finalists, {d + 1: b[0] for d, b in enumerate(beams[:-1])}, len(beams), holdings_ratio, excluded
+        finalists, {d + 1: b[0] for d, b in enumerate(beams[:-1])}, len(beams), holdings_ratio, excluded, trimmed
     )

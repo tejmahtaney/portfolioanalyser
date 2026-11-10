@@ -33,7 +33,7 @@ The optimiser, frontier and backtest run when you press **Run optimisation** or 
 
 ## Add positions
 
-The second page of the app finds stocks to add to a portfolio. Upload a workbook exported from the Portfolio risk page, pick candidates (a watchlist from the universe, or the S&P 500), the maximum number of new positions (1 to 5) and a mode: **Reweight everything** recomputes all weights at risk parity; **Keep current holdings** holds their proportions fixed and sizes them as one block. Press **Run search**; changing an input does not rerun it, and the result is kept in the session for those inputs.
+The second page of the app finds stocks to add to a portfolio. Upload a workbook exported from the Portfolio risk page, pick candidates (a watchlist from the universe, or the S&P 500), the maximum number of new positions (1 to 10) and a mode: **Reweight everything** recomputes all weights at risk parity; **Keep current holdings** holds their proportions fixed and sizes them as one block. Press **Run search**; changing an input does not rerun it, and the result is kept in the session for those inputs.
 
 Each finalist shows its diversification ratio, volatility, effective number of assets and backtest status, with the out-of-sample Sharpe ratio against a baseline without additions. A finalist is flagged when its status changes if February to April 2020 is left out. If a current holding has under 500 weeks of history no finalist can be backtested, and the page names the holding and its weeks. Selecting a finalist shows its trades; a trade inside the no-trade band (default 5 points and 25% of the target, both adjustable without rerunning) shows as "–". **Export target weights** writes an xlsx that the Portfolio risk page can import.
 

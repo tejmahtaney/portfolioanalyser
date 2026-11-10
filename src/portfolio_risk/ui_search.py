@@ -11,15 +11,21 @@ from .search import Finalist, SearchResult
 
 SOURCES = ("Watchlist", "S&P 500")
 MODE_LABELS = {"Reweight everything": "reweight", "Keep current holdings": "keep"}
+SIZING_LABELS = {
+    f"Fixed {search.SLICE:.0%} per addition": "slice", "Risk parity": "risk_parity",
+    "Balanced (risk parity + max Sharpe)": "balanced",
+}
 MAX_REMEMBERED_SEARCHES = 6
 DASH = "–"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # Widget keys. Streamlit drops a widget's state while another page is showing, so these are copied aside and restored.
 K_SOURCE, K_WATCH, K_MAX_NEW, K_MODE = "ap_source", "ap_watchlist", "ap_max_new", "ap_mode"
+K_SIZING, K_CAP, K_TILT = "ap_sizing", "ap_cap", "ap_tilt"
 K_BAND_ABS, K_BAND_REL, K_FINALIST = "ap_band_abs", "ap_band_rel", "ap_finalist"
 DEFAULTS = {
     K_SOURCE: SOURCES[0], K_WATCH: [], K_MAX_NEW: 3, K_MODE: "Reweight everything",
+    K_SIZING: next(iter(SIZING_LABELS)), K_CAP: False, K_TILT: int(search.DEFAULT_TILT * 100),
     K_BAND_ABS: search.BAND_ABSOLUTE * 100, K_BAND_REL: search.BAND_RELATIVE * 100, K_FINALIST: None,
 }
 HOLDINGS_KEY, RESULTS_KEY = "ap_holdings", "ap_results"
@@ -62,6 +68,9 @@ def finalist_table(result: SearchResult) -> pd.DataFrame:
         rows.append(
             {
                 "Added": ", ".join(f.tickers),
+                "Δ Volatility": f"{f.metrics.d_volatility:+.2%}",
+                "Δ CVaR": f"{f.metrics.d_cvar:+.2%}",
+                "Correlation": f"{f.metrics.correlation:.2f}",
                 "Diversification ratio": f"{f.diversification_ratio:.3f}",
                 "Volatility": f"{f.volatility:.2%}",
                 "Effective assets": f"{f.effective_assets:.1f}",
@@ -133,9 +142,9 @@ def keep_inputs() -> None:
             st.session_state[f"kept_{key}"] = st.session_state[key]
 
 
-def search_key(holdings: pd.Series, candidates: tuple, max_new: int, mode: str) -> tuple:
+def search_key(holdings: pd.Series, candidates: tuple, max_new: int, mode: str, sizing: str, cap: bool, tilt: int) -> tuple:
     held = tuple(sorted((t, round(float(w), 6)) for t, w in holdings.items() if w > 0))
-    return held, candidates, max_new, mode
+    return held, candidates, max_new, mode, sizing, cap, tilt
 
 
 def remember(key: tuple, stored: Stored) -> None:
@@ -190,15 +199,18 @@ def candidate_inputs(uni: pd.DataFrame) -> tuple:
     return ("watchlist", tuple(sorted(watch)))
 
 
-def run_search(held_pct: pd.Series, candidates: tuple, max_new: int, mode_label: str, key: tuple) -> None:
-    mode = MODE_LABELS[mode_label]
+def run_search(
+    held_pct: pd.Series, candidates: tuple, max_new: int, mode_label: str, sizing_label: str, cap: bool, tilt: int,
+    key: tuple,
+) -> None:
+    mode, sizing = MODE_LABELS[mode_label], SIZING_LABELS[sizing_label]
     bar = st.progress(0.0, text="Loading prices…")
 
     def on_load(message: str) -> None:
         bar.progress(0.0, text=message)
 
     def on_depth(depth: int, total: int, best: search.ScoredSet) -> None:
-        bar.progress(depth / total, text=f"Additions {depth} of {total}: best {', '.join(best.tickers)} ({best.ratio:.3f})")
+        bar.progress(depth / total, text=f"Additions {depth} of {total}: best {', '.join(best.tickers)} ({best.metrics.d_volatility:+.2%} volatility)")
 
     try:
         warning = None
@@ -208,7 +220,7 @@ def run_search(held_pct: pd.Series, candidates: tuple, max_new: int, mode_label:
             tickers = list(candidates[1])
         returns, failures = search.load_history(list(held_pct.index), tickers, progress=on_load)
         result = search.search(
-            returns, held_pct, tickers, max_new=max_new, mode=mode, unavailable=failures, progress=on_depth,
+            returns, held_pct, tickers, max_new=max_new, mode=mode, sizing=sizing, cap_positions=cap, tilt=tilt / 100, unavailable=failures, progress=on_depth,
         )
     except Exception as exc:
         bar.empty()
@@ -218,6 +230,10 @@ def run_search(held_pct: pd.Series, candidates: tuple, max_new: int, mode_label:
     if warning:
         st.warning(warning)
     held_weeks = {t: int(returns[t].notna().sum()) if t in returns else 0 for t in held_pct.index}
+    if result.trimmed_weeks:
+        st.warning(
+            f"The latest {result.trimmed_weeks} week(s) were left out: at least one holding has no price for them yet."
+        )
     remember(key, Stored(result, held_weeks, mode))
 
 
@@ -227,7 +243,11 @@ def show_results(stored: Stored, names: pd.Series, absolute: float, relative: fl
         st.info("No finalists.")
         return
     st.subheader("Finalists")
-    st.caption(f"Holdings alone: diversification ratio {result.holdings_ratio:.3f}. Best first.")
+    st.caption(
+        f"Ranked by the mean rank on change in volatility, change in CVaR and correlation with your holdings, each "
+        f"addition at {search.SLICE:.0%}. "
+        f"Holdings alone: diversification ratio {result.holdings_ratio:.3f}."
+    )
     notice = no_backtest_notice(stored)
     if notice:
         getattr(st, notice[0])(notice[1])
@@ -275,7 +295,26 @@ def page() -> None:
     held_pct = show_holdings(holdings) if holdings is not None else None
     candidates = candidate_inputs(uni)
     max_new = st.slider("Maximum new positions", 1, search.MAX_NEW_LIMIT, key=K_MAX_NEW)
-    mode_label = st.radio("Mode", list(MODE_LABELS), horizontal=True, key=K_MODE)
+    sizing_label = st.radio(
+        "Sizing", list(SIZING_LABELS), horizontal=True, key=K_SIZING,
+        help="Fixed: each addition at that weight, holdings scaled down in proportion. "
+        "Risk parity: sized for equal risk. Balanced: risk parity blended with the max Sharpe weights.",
+    )
+    mode_label = st.radio(
+        "Mode (risk parity and balanced)", list(MODE_LABELS), horizontal=True, key=K_MODE,
+        disabled=SIZING_LABELS[sizing_label] == "slice",
+    )
+    cap = st.checkbox(
+        "Cap positions at my largest holding (risk parity and balanced)", key=K_CAP,
+        disabled=SIZING_LABELS[sizing_label] == "slice",
+        help="No recommended position is larger than the largest weight in your portfolio. Positions above it "
+        "are held at it and the rest re-solved; none is dropped.",
+    )
+    tilt = st.slider(
+        "Max Sharpe share (%)", 0, 100, step=5, key=K_TILT, disabled=SIZING_LABELS[sizing_label] != "balanced",
+        help="Balanced sizing: 0 is pure risk parity, 100 is pure max Sharpe. Max Sharpe uses shrunk historical "
+        "returns, so it favours what did best over the window.",
+    )
     left, right = st.columns(2)
     absolute = left.number_input(
         "Band: absolute (points)", min_value=0.0, max_value=100.0, step=0.5, key=K_BAND_ABS,
@@ -288,9 +327,9 @@ def page() -> None:
     keep_inputs()
 
     ready = held_pct is not None and not held_pct.empty and (candidates[0] == "sp500" or bool(candidates[1]))
-    key = search_key(held_pct, candidates, max_new, MODE_LABELS[mode_label]) if ready else None
+    key = search_key(held_pct, candidates, max_new, MODE_LABELS[mode_label], SIZING_LABELS[sizing_label], cap, tilt) if ready else None
     if st.button("Run search", type="primary", disabled=not ready):
-        run_search(held_pct, candidates, max_new, mode_label, key)
+        run_search(held_pct, candidates, max_new, mode_label, sizing_label, cap, tilt, key)
     if not ready:
         st.info("Upload a portfolio and choose candidates to begin.")
     else:

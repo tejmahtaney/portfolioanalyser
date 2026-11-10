@@ -116,11 +116,10 @@ def test_page_runs_end_to_end_on_a_synthetic_portfolio(env):
 
     finalists = at.dataframe[1].value
     assert list(finalists.columns) == [
-        "Added", "Diversification ratio", "Volatility", "Effective assets", "Backtest", "Sharpe (out of sample)",
+        "Added", "Δ Volatility", "Δ CVaR", "Correlation", "Diversification ratio", "Volatility", "Effective assets", "Backtest", "Sharpe (out of sample)",
         "Sharpe (baseline)", "Max drawdown", "Without Feb–Apr 2020",
     ]
-    ratios = finalists["Diversification ratio"].astype(float).tolist()
-    assert ratios == sorted(ratios, reverse=True)
+    assert finalists["Δ Volatility"].str.startswith("-").iloc[0]
     assert set(finalists["Backtest"]) <= {search.PASSES, search.FAILS}
 
     trades = at.dataframe[2].value
@@ -144,7 +143,20 @@ def test_run_button_is_the_only_trigger(env):
     next(b for b in at.button if b.label == "Run search").click()
     at.run()
     assert env["searches"] == 1
-    at.radio[1].set_value("Keep current holdings").run()
+    at.radio[1].set_value("Risk parity").run()
+    assert env["searches"] == 1
+    assert any("Press Run search" in i.value for i in at.info)
+
+
+def test_balanced_sizing_runs_and_the_share_slider_changes_the_result_key(env):
+    at = launch()
+    at.radio[1].set_value("Balanced (risk parity + max Sharpe)")
+    at.run()
+    assert not at.slider[1].disabled
+    at = run_search(at)
+    assert not at.error
+    assert env["searches"] == 1
+    at.slider[1].set_value(80).run()
     assert env["searches"] == 1
     assert any("Press Run search" in i.value for i in at.info)
 
@@ -175,7 +187,7 @@ def test_inputs_and_result_survive_a_visit_to_the_other_page(env):
     at.run()
     run_search(at)
     assert env["searches"] == 1
-    ratios = list(at.dataframe[1].value["Diversification ratio"])
+    ratios = list(at.dataframe[1].value["Added"])
 
     at.session_state["show"] = "risk"
     at.run()
@@ -184,7 +196,7 @@ def test_inputs_and_result_survive_a_visit_to_the_other_page(env):
     at.run()
     assert not at.exception
     assert env["searches"] == 1
-    assert list(at.dataframe[1].value["Diversification ratio"]) == ratios
+    assert list(at.dataframe[1].value["Added"]) == ratios
     assert at.slider[0].value == 2
 
 
@@ -246,7 +258,9 @@ def test_excluded_candidates_are_listed_in_a_collapsed_expander(env):
 def test_trade_display_shows_dash_for_blank_trades():
     weights = pd.Series({"A": 0.5, "B": 0.5})
     trades = pd.DataFrame({"Target": weights, "Current": [0.49, 0.2], "Trade": [np.nan, 0.3]})
-    finalist = search.Finalist(("B",), 1.0, 0.1, 2.0, weights, trades, search.Backtest(search.NO_BACKTEST))
+    finalist = search.Finalist(
+        ("B",), search.Metrics(-0.01, -0.01, 0.2), 1.0, 1.0, 0.1, 2.0, weights, trades, search.Backtest(search.NO_BACKTEST)
+    )
     out = ui_search.trade_display(finalist, 0.05, 0.25, pd.Series({"A": "Alpha"}))
     assert out.loc["A", "Trade"] == "–"
     assert out.loc["B", "Trade"] == "+30.00%"

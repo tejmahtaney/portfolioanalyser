@@ -104,8 +104,9 @@ def test_uncorrelated_candidate_is_in_top_set():
     res = search.search(r, holdings(), candidates(r), max_new=1)
     assert res.finalists[0].tickers == ("IND",)
     assert len(res.finalists) == 5
-    ratios = [f.diversification_ratio for f in res.finalists]
-    assert ratios == sorted(ratios, reverse=True)
+    scores = [f.score for f in res.finalists]
+    assert scores == sorted(scores)
+    assert res.finalists[0].metrics.d_volatility < 0
 
 
 def test_uncorrelated_candidate_is_in_top_set_at_depth_two():
@@ -122,7 +123,7 @@ def test_held_tickers_are_not_candidates():
 
 def test_keep_mode_preserves_internal_proportions():
     r = make_returns()
-    res = search.search(r, holdings(), candidates(r), max_new=2, mode="keep")
+    res = search.search(r, holdings(), candidates(r), max_new=2, mode="keep", sizing="risk_parity")
     props = holdings() / holdings().sum()
     for f in res.finalists:
         held = f.weights[HELD]
@@ -132,7 +133,7 @@ def test_keep_mode_preserves_internal_proportions():
 
 def test_reweight_mode_changes_proportions():
     r = make_returns()
-    res = search.search(r, holdings(), candidates(r), max_new=1, mode="reweight")
+    res = search.search(r, holdings(), candidates(r), max_new=1, mode="reweight", sizing="risk_parity")
     held = res.finalists[0].weights[HELD]
     props = holdings() / holdings().sum()
     assert (held / held.sum() - props).abs().max() > 1e-3
@@ -165,40 +166,55 @@ def test_candidate_with_156_to_full_weeks_is_searched_but_not_backtested():
     assert "C1" not in res.excluded
 
 
-def greedy(returns, held, props, cands, max_new, half_life=52):
-    """Plain greedy search, scored through analytics and cvxpy rather than the search module's solver."""
+def greedy(returns, held, props, cands, max_new):
+    """Plain greedy search on the same fixed-slice metrics, computed with pandas alone."""
     window = returns.iloc[-search.WINDOW_WEEKS :]
+    hold = window[held] @ props
 
-    def ratio(names):
-        cov = analytics.annual_covariance(window[names], "ewma", half_life)
-        w = optimiser.risk_parity(cov, None).weights
-        sigma = pd.Series(np.sqrt(np.diag(cov)), index=cov.index)
-        return float(w @ sigma / analytics.portfolio_volatility(w, cov))
+    def cvar(x):
+        return -x.nsmallest(max(1, int(np.ceil(search.CVAR_LEVEL * len(x))))).mean()
 
-    chosen, best = [], None
+    def metrics(names):
+        sleeve = window[list(names)].sum(axis=1)
+        p = hold * (1 - search.SLICE * len(names)) + search.SLICE * sleeve
+        return [(p.std() - hold.std()) * np.sqrt(52), cvar(p) - cvar(hold), hold.corr(sleeve)]
+
+    eligible = [c for c in sorted(cands) if metrics([c])[1] <= 0]
+    chosen, prev = [], None
     for _ in range(max_new):
-        scored = {c: ratio([*held, *chosen, c]) for c in sorted(cands) if c not in chosen}
-        pick = max(scored, key=lambda c: (scored[c], c))
-        if best is not None and scored[pick] <= best:
+        rows = {c: metrics([*chosen, c]) for c in eligible if c not in chosen}
+        table = pd.DataFrame.from_dict(rows, orient="index")
+        pick = min(rows, key=lambda c: (table.rank().mean(axis=1)[c], c))
+        if prev is not None and rows[pick][0] >= prev:
             break
         chosen.append(pick)
-        best = scored[pick]
+        prev = rows[pick][0]
     return tuple(sorted(chosen))
 
 
 def test_beam_width_one_equals_greedy():
     r = make_returns()
     cands = candidates(r)
+    props = holdings() / holdings().sum()
     res = search.search(r, holdings(), cands, max_new=3, beam_width=1, backtest=False)
     assert len(res.finalists) == 1
-    assert res.finalists[0].tickers == greedy(r, HELD, None, cands, 3)
+    assert res.finalists[0].tickers == greedy(r, HELD, props, cands, 3)
 
 
-def test_wider_beam_is_never_worse_than_greedy():
+def test_candidate_that_raises_cvar_is_excluded_and_listed():
     r = make_returns()
-    narrow = search.search(r, holdings(), candidates(r), max_new=3, beam_width=1, backtest=False)
-    wide = search.search(r, holdings(), candidates(r), max_new=3, beam_width=5, backtest=False)
-    assert wide.finalists[0].diversification_ratio >= narrow.finalists[0].diversification_ratio - 1e-12
+    crash = np.where(np.random.default_rng(9).random(len(r)) < 0.1, -0.9, 0.002)
+    r["CRASH"] = crash
+    res = search.search(r, holdings(), [*candidates(r), "CRASH"], max_new=2, backtest=False)
+    assert "CVaR" in res.excluded["CRASH"]
+    assert all("CRASH" not in f.tickers for f in res.finalists)
+
+
+def test_error_when_every_candidate_raises_cvar():
+    r = make_returns()
+    r["CRASH"] = np.where(np.random.default_rng(9).random(len(r)) < 0.1, -0.9, 0.002)
+    with pytest.raises(ValueError, match="CVaR"):
+        search.search(r, holdings(), ["CRASH"], max_new=1, backtest=False)
 
 
 def test_progress_reports_each_depth_and_best_by_depth():
@@ -213,7 +229,7 @@ def test_progress_reports_each_depth_and_best_by_depth():
 
 def test_max_new_out_of_range():
     r = make_returns()
-    for bad in (0, 6):
+    for bad in (0, 11):
         with pytest.raises(ValueError):
             search.search(r, holdings(), candidates(r), max_new=bad)
 
@@ -332,8 +348,144 @@ def test_keep_mode_baseline_is_current_weights_held_fixed():
     assert np.allclose(base, r[HELD].iloc[156:] @ props)
 
 
-def test_finalist_order_follows_diversification_ratio_not_sharpe():
+def test_finalist_order_follows_score_not_sharpe():
     r = make_returns()
     res = search.search(r, holdings(), candidates(r), max_new=2)
-    ratios = [f.diversification_ratio for f in res.finalists]
-    assert ratios == sorted(ratios, reverse=True)
+    scores = [f.score for f in res.finalists]
+    assert scores == sorted(scores)
+
+
+def test_trailing_week_missing_for_a_holding_is_trimmed_not_fatal():
+    r = make_returns()
+    r.loc[r.index[-1], HELD] = np.nan
+    res = search.search(r, holdings(), candidates(r), max_new=1, backtest=False)
+    assert res.trimmed_weeks == 1
+
+
+def test_longer_trailing_gap_in_a_holding_still_fails():
+    r = make_returns()
+    r.loc[r.index[-5:], "H1"] = np.nan
+    with pytest.raises(ValueError, match="H1"):
+        search.search(r, holdings(), candidates(r), max_new=1, backtest=False)
+
+
+# --- position cap --------------------------------------------------------------------------------------------
+
+
+def test_capped_solver_holds_binding_assets_at_the_cap_and_keeps_every_asset():
+    cov = np.diag([0.01, 0.04, 0.04, 0.04]) + 0.005
+    upper = np.array([0.3, 0.3, 0.3, 0.3])
+    free = search.risk_parity_weights(cov)
+    assert free.max() > 0.3
+    w = search.capped_risk_parity_weights(cov, upper)
+    assert w.sum() == pytest.approx(1)
+    assert (w <= 0.3 + 1e-9).all()
+    assert (w > 0).all()
+    assert w.max() == pytest.approx(0.3)
+
+
+def test_capped_solver_is_unchanged_when_the_cap_does_not_bind():
+    cov = random_covariance(np.random.default_rng(1))
+    w = search.capped_risk_parity_weights(cov, np.ones(len(cov)))
+    assert w == pytest.approx(search.risk_parity_weights(cov))
+
+
+@pytest.mark.parametrize("mode", search.MODES)
+def test_cap_positions_limits_every_position_to_the_largest_input(mode):
+    r = make_returns()
+    even = pd.Series({"H1": 34.0, "H2": 33.0, "H3": 33.0})
+    kw = dict(max_new=2, mode=mode, sizing="risk_parity", backtest=False)
+    capped = search.search(r, even, candidates(r), cap_positions=True, **kw)
+    for f in capped.finalists:
+        assert f.weights.max() <= 0.34 + 1e-9
+        assert (f.weights > 0).all()
+        assert f.weights.sum() == pytest.approx(1)
+
+
+def test_risk_parity_is_uncapped_by_default():
+    r = make_returns()
+    even = pd.Series({"H1": 34.0, "H2": 33.0, "H3": 33.0})
+    res = search.search(r, even, candidates(r), max_new=2, mode="keep", sizing="risk_parity", backtest=False)
+    assert max(f.weights.max() for f in res.finalists) > 0.34 + 1e-6
+
+
+# --- slice sizing ----------------------------------------------------------------------------------------------------
+
+
+def test_slice_sizing_puts_each_addition_at_the_slice_and_scales_the_holdings():
+    r = make_returns()
+    res = search.search(r, holdings(), candidates(r), max_new=2, backtest=False)
+    props = holdings() / holdings().sum()
+    for f in res.finalists:
+        k = len(f.tickers)
+        assert f.weights[list(f.tickers)].tolist() == pytest.approx([search.SLICE] * k)
+        assert f.weights[HELD].to_numpy() == pytest.approx((props * (1 - search.SLICE * k)).to_numpy())
+        assert f.weights.sum() == pytest.approx(1)
+
+
+def test_slice_is_limited_to_the_largest_input_position():
+    r = make_returns()
+    small = pd.Series({"H1": 2.0, "H2": 2.0, "H3": 1.0})
+    res = search.search(r, small, candidates(r), max_new=1, backtest=False)
+    assert res.finalists[0].weights.max() <= 0.4 + 1e-9
+
+
+def test_slice_sizing_is_backtested_against_the_current_weights():
+    r = make_returns()
+    res = search.search(r, holdings(), candidates(r), max_new=1, beam_width=2)
+    assert all(f.backtest.status in (search.PASSES, search.FAILS) for f in res.finalists)
+    assert all(f.backtest.full.weeks > 0 for f in res.finalists)
+
+
+# --- balanced sizing -----------------------------------------------------------------------------------------
+
+
+def test_cap_weights_holds_the_excess_at_the_bound_and_keeps_the_total():
+    w = search.cap_weights(np.array([0.6, 0.3, 0.1]), np.array([0.4, 1.0, 1.0]))
+    assert w.sum() == pytest.approx(1)
+    assert w[0] == pytest.approx(0.4)
+    assert w[1] / w[2] == pytest.approx(3)
+
+
+def balanced(r, tilt, **kw):
+    return search.search(
+        r, holdings(), candidates(r), max_new=2, mode="reweight", sizing="balanced", tilt=tilt, backtest=False, **kw
+    )
+
+
+def test_balanced_with_zero_tilt_is_risk_parity():
+    r = make_returns()
+    rp = search.search(r, holdings(), candidates(r), max_new=2, mode="reweight", sizing="risk_parity", backtest=False)
+    zero = balanced(r, 0.0)
+    for a, b in zip(rp.finalists, zero.finalists):
+        assert a.weights.to_numpy() == pytest.approx(b.weights.to_numpy())
+
+
+def test_balanced_lies_between_risk_parity_and_max_sharpe_and_sums_to_one():
+    r = make_returns()
+    for f in balanced(r, 0.5).finalists:
+        assert f.weights.sum() == pytest.approx(1)
+        assert (f.weights >= 0).all()
+
+
+def test_balanced_respects_the_cap_when_asked():
+    r = make_returns()
+    even = pd.Series({"H1": 34.0, "H2": 33.0, "H3": 33.0})
+    res = search.search(
+        r, even, candidates(r), max_new=2, mode="reweight", sizing="balanced", tilt=0.5, cap_positions=True,
+        backtest=False,
+    )
+    for f in res.finalists:
+        assert f.weights.max() <= 0.34 + 1e-9
+
+
+def test_balanced_is_backtested():
+    r = make_returns()
+    res = search.search(r, holdings(), candidates(r), max_new=1, beam_width=2, sizing="balanced", mode="keep")
+    assert all(f.backtest.status in (search.PASSES, search.FAILS) for f in res.finalists)
+
+
+def test_tilt_outside_zero_one_is_an_error():
+    r = make_returns()
+    with pytest.raises(ValueError, match="tilt"):
+        search.search(r, holdings(), candidates(r), max_new=1, tilt=1.5)
