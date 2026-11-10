@@ -5,7 +5,8 @@ proportion. A candidate that raises the portfolio's CVaR is dropped. A set is ra
 the change in volatility, the change in CVaR and the correlation of the additions with the holdings, over the last
 WINDOW_WEEKS weeks. The finalists are then sized in one of three ways: each addition at SLICE (the default, or the
 largest input position when that is smaller); by risk parity with an EWMA covariance; or "balanced", risk parity
-blended with the max Sharpe weights. The last two can cap every position at the largest input position. Stage 2 runs
+blended with the max Sharpe weights. The last two can cap every position at the largest input position. Under every
+sizing the additions together take at most a set share of the portfolio (new_budget). Stage 2 runs
 a walk-forward backtest over the full history for each finalist and compares its out-of-sample Sharpe ratio with a
 baseline that has no additions.
 
@@ -43,6 +44,7 @@ COVID_END = pd.Timestamp("2020-04-30")
 MODES = ("reweight", "keep")
 SIZINGS = ("slice", "risk_parity", "balanced")
 DEFAULT_TILT = 0.5  # share of max Sharpe in balanced sizing
+DEFAULT_NEW_BUDGET = 0.15  # largest total weight of the additions offered by the page
 BLOCK = "current holdings"
 SLICE = 0.05  # weight of each addition while ranking, and in the recommendation under slice sizing
 CVAR_LEVEL = 0.10  # share of the worst weeks averaged for CVaR
@@ -124,6 +126,28 @@ def cap_weights(w: np.ndarray, upper: np.ndarray) -> np.ndarray:
         if not free.any() or w[free].sum() <= 0:
             return w
         w[free] *= (1.0 - w[~free].sum()) / w[free].sum()
+
+
+def allocate(relative: np.ndarray, total: float, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+    """Weights summing to `total`, each inside [lower, upper], as close to proportional to `relative` as the bounds
+    allow: w_i = clip(s * relative_i, lower_i, upper_i), with the scale s found by bisection."""
+    if len(relative) == 0:
+        return relative.astype(float)
+    if lower.sum() > total + 1e-12 or upper.sum() < total - 1e-12:
+        raise OptimisationError("The position limits cannot be met together.")
+    relative = np.maximum(relative, 1e-12)
+    low, high = 0.0, float((upper / relative).max())
+    for _ in range(200):
+        mid = (low + high) / 2
+        if np.clip(mid * relative, lower, upper).sum() < total:
+            low = mid
+        else:
+            high = mid
+    w = np.clip(high * relative, lower, upper)
+    free = (w > lower + 1e-12) & (w < upper - 1e-12)
+    if free.any():  # removes the bisection residue
+        w[free] += (total - w.sum()) * w[free] / w[free].sum()
+    return w
 
 
 # --- Result types --------------------------------------------------------------------------------------------
@@ -249,11 +273,13 @@ def _frame(window: pd.DataFrame, held: list[str], props: pd.Series, mode: str) -
 @dataclass(frozen=True)
 class Sizing:
     """cap: largest weight any single stock may take. tilt: share of the max Sharpe weights in the blend with risk
-    parity (0 is pure risk parity). risk_free: for the max Sharpe weights."""
+    parity (0 is pure risk parity). risk_free: for the max Sharpe weights. budget: largest total weight of the
+    additions."""
 
     cap: float = 1.0
     tilt: float = 0.0
     risk_free: float = DEFAULT_RISK_FREE
+    budget: float = 1.0
 
 
 @dataclass
@@ -287,9 +313,23 @@ def _fit(
         try:
             sharpe_w = optimiser.max_sharpe(mu, cov_df, sizing.risk_free, None).weights.to_numpy()
         except OptimisationError:
-            return _Fit(labels, cov, w)
-        w = cap_weights((1 - sizing.tilt) * w + sizing.tilt * sharpe_w, upper)
-    return _Fit(labels, cov, w)
+            sharpe_w = None
+        if sharpe_w is not None:
+            w = cap_weights((1 - sizing.tilt) * w + sizing.tilt * sharpe_w, upper)
+    return _Fit(labels, cov, _limit_additions(w, len(base), upper, sizing))
+
+
+def _limit_additions(w: np.ndarray, n_base: int, upper: np.ndarray, sizing: Sizing) -> np.ndarray:
+    """Scales the additions down to sizing.budget in total when they exceed it, and the rest up to fill the gap.
+    Each side keeps its internal proportions, as far as the cap allows."""
+    total = float(w[n_base:].sum())
+    if n_base == len(w) or total <= sizing.budget + 1e-12:
+        return w
+    zero = np.zeros(len(w))
+    out = np.empty(len(w))
+    out[n_base:] = allocate(w[n_base:], sizing.budget, zero[n_base:], upper[n_base:])
+    out[:n_base] = allocate(w[:n_base], 1 - sizing.budget, zero[:n_base], upper[:n_base])
+    return out
 
 
 def _expand(fit: _Fit, held: list[str], props: pd.Series, mode: str) -> pd.Series:
@@ -306,9 +346,10 @@ def _cvar(returns: np.ndarray) -> float:
     return float(-np.sort(returns)[:worst].mean())
 
 
-def _slice_size(props: pd.Series) -> float:
-    """Weight of each addition: SLICE, or the largest input position when that is smaller."""
-    return min(SLICE, float(props.max()))
+def _slice_size(props: pd.Series, n_adds: int = 1, budget: float = 1.0) -> float:
+    """Weight of each addition: SLICE, or the largest input position or an equal share of the budget for
+    additions when one of those is smaller."""
+    return min(SLICE, float(props.max()), budget / n_adds)
 
 
 def _slice_returns(hold: pd.Series, panel: pd.DataFrame, adds: Sequence[str], size: float) -> pd.Series:
@@ -440,7 +481,8 @@ def _backtest(
         if key not in baselines:
             baselines[key] = _baseline(window[held], held, props, "keep", half_life, train, hold)
         baseline = baselines[key]
-        oos = _slice_returns(window[held] @ props[held], window, adds, _slice_size(props)).iloc[train:]
+        size = _slice_size(props, len(adds), fit_sizing.budget)
+        oos = _slice_returns(window[held] @ props[held], window, adds, size).iloc[train:]
     else:
         if key not in baselines:
             baselines[key] = _baseline(window[held], held, props, mode, half_life, train, hold, fit_sizing)
@@ -463,6 +505,7 @@ def search(
     sizing: str = "slice",
     cap_positions: bool = False,
     tilt: float = DEFAULT_TILT,
+    new_budget: float = 1.0,
     absolute_band: float = BAND_ABSOLUTE,
     relative_band: float = BAND_RELATIVE,
     beam_width: int = BEAM_WIDTH,
@@ -475,7 +518,8 @@ def search(
     """Finds the sets of up to `max_new` new tickers that most improve the holdings, then sizes them by risk parity.
 
     returns: weekly returns, ten years for the backtest. holdings: weights as from excel_io.import_weights (any
-    scale; normalised here). unavailable: tickers that could not be loaded, with reasons (load_history).
+    scale; normalised here). new_budget: largest total weight of the additions, under every sizing; ranking
+    still uses SLICE per addition. unavailable: tickers that could not be loaded, with reasons (load_history).
     """
     if not 1 <= max_new <= MAX_NEW_LIMIT:
         raise ValueError(f"max_new must be between 1 and {MAX_NEW_LIMIT}.")
@@ -485,6 +529,8 @@ def search(
         raise ValueError(f"sizing must be one of {SIZINGS}.")
     if not 0 <= tilt <= 1:
         raise ValueError("tilt must be between 0 and 1.")
+    if not 0 < new_budget <= 1:
+        raise ValueError("new_budget must be above 0 and at most 1.")
 
     props = _clean_holdings(holdings)
     held = list(props.index)
@@ -529,8 +575,8 @@ def search(
     max_new = min(max_new, len(eligible))
 
     frame, base = _frame(window, held, props, mode)
-    fit_sizing = Sizing(  # risk parity and balanced sizing only
-        float(props.max()) if cap_positions else 1.0, tilt if sizing == "balanced" else 0.0, risk_free
+    fit_sizing = Sizing(  # cap and tilt: risk parity and balanced sizing only
+        float(props.max()) if cap_positions else 1.0, tilt if sizing == "balanced" else 0.0, risk_free, new_budget
     )
 
     def best(keys: Iterable[tuple[str, ...]]) -> list[ScoredSet]:
@@ -560,7 +606,7 @@ def search(
     finalists = []
     for chosen in beams[-1]:
         if sizing == "slice":
-            weights = _slice_weights(props, chosen.tickers, size)
+            weights = _slice_weights(props, chosen.tickers, _slice_size(props, len(chosen.tickers), new_budget))
             ratio, volatility = _stats(window, weights, half_life)
         else:
             fit = _fit(frame, base, chosen.tickers, half_life, fit_sizing)

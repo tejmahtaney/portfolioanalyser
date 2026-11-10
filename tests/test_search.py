@@ -489,3 +489,74 @@ def test_tilt_outside_zero_one_is_an_error():
     r = make_returns()
     with pytest.raises(ValueError, match="tilt"):
         search.search(r, holdings(), candidates(r), max_new=1, tilt=1.5)
+
+
+# --- budget for new positions --------------------------------------------------------------------------------
+
+
+def test_allocate_is_proportional_inside_the_bounds_and_sums_to_the_total():
+    w = search.allocate(np.array([6.0, 3.0, 1.0]), 0.5, np.zeros(3), np.array([0.2, 1.0, 1.0]))
+    assert w.sum() == pytest.approx(0.5)
+    assert w[0] == pytest.approx(0.2)
+    assert w[1] / w[2] == pytest.approx(3.0)
+    with pytest.raises(optimiser.OptimisationError):
+        search.allocate(np.ones(2), 0.5, np.zeros(2), np.array([0.2, 0.2]))
+
+
+@pytest.mark.parametrize("mode", search.MODES)
+@pytest.mark.parametrize("sizing", ["risk_parity", "balanced"])
+def test_additions_take_at_most_the_budget_and_each_side_keeps_its_proportions(mode, sizing):
+    returns = make_returns()
+    kw = dict(max_new=3, mode=mode, sizing=sizing, backtest=False)
+    free = search.search(returns, holdings(), candidates(returns), **kw).finalists[0]
+    limited = search.search(returns, holdings(), candidates(returns), new_budget=0.15, **kw).finalists[0]
+    adds = list(limited.tickers)
+    assert free.tickers == limited.tickers
+    assert free.weights[adds].sum() > 0.15
+    assert limited.weights[adds].sum() == pytest.approx(0.15)
+    assert limited.weights.sum() == pytest.approx(1.0)
+    np.testing.assert_allclose(limited.weights[adds] / 0.15, free.weights[adds] / free.weights[adds].sum())
+    np.testing.assert_allclose(limited.weights[HELD] / 0.85, free.weights[HELD] / free.weights[HELD].sum())
+
+
+def test_budget_that_does_not_bind_changes_nothing():
+    returns = make_returns()
+    kw = dict(max_new=2, sizing="risk_parity", backtest=False)
+    free = search.search(returns, holdings(), candidates(returns), **kw).finalists[0]
+    loose = search.search(returns, holdings(), candidates(returns), new_budget=0.99, **kw).finalists[0]
+    pd.testing.assert_series_equal(free.weights, loose.weights)
+
+
+def test_budget_shrinks_the_slice_when_the_additions_would_exceed_it():
+    returns = make_returns()
+    result = search.search(returns, holdings(), candidates(returns), max_new=3, new_budget=0.09, backtest=False)
+    top = result.finalists[0]
+    k = len(top.tickers)
+    size = min(search.SLICE, 0.09 / k)
+    assert top.weights[list(top.tickers)].tolist() == pytest.approx([size] * k)
+    assert top.weights[HELD].tolist() == pytest.approx(list(holdings() / 100 * (1 - size * k)))
+
+
+def test_budget_with_the_cap_keeps_every_position_under_the_largest_input():
+    returns = make_returns()
+    top = search.search(
+        returns, holdings(), candidates(returns), max_new=3, sizing="risk_parity", cap_positions=True,
+        new_budget=0.10, backtest=False,
+    ).finalists[0]
+    assert top.weights.max() <= 0.5 + 1e-9
+    assert top.weights[list(top.tickers)].sum() == pytest.approx(0.10)
+
+
+def test_budget_applies_in_the_walk_forward_backtest():
+    returns = make_returns()
+    kw = dict(max_new=2, mode="keep", sizing="risk_parity")
+    free = search.search(returns, holdings(), candidates(returns), **kw).finalists[0]
+    limited = search.search(returns, holdings(), candidates(returns), new_budget=0.10, **kw).finalists[0]
+    assert limited.backtest.full.correlation > free.backtest.full.correlation
+
+
+@pytest.mark.parametrize("budget", [0.0, 1.5])
+def test_budget_outside_its_range_is_an_error(budget):
+    returns = make_returns()
+    with pytest.raises(ValueError, match="new_budget"):
+        search.search(returns, holdings(), candidates(returns), new_budget=budget)

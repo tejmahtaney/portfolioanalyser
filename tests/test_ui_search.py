@@ -166,17 +166,30 @@ def test_changing_a_band_threshold_does_not_rerun_the_search(env):
     assert env["searches"] == 1
     default_trades = trade_column(at)
     assert "–" in default_trades  # the default band leaves some trades blank
-    at.number_input[0].set_value(0.0)
-    at.number_input[1].set_value(0.0)
+    at.number_input(key="ap_band_abs").set_value(0.0)
+    at.number_input(key="ap_band_rel").set_value(0.0)
     at.run()
     assert not at.exception
     assert env["searches"] == 1
     assert "–" not in trade_column(at)
-    at.number_input[0].set_value(5.0)
-    at.number_input[1].set_value(25.0)
+    at.number_input(key="ap_band_abs").set_value(5.0)
+    at.number_input(key="ap_band_rel").set_value(25.0)
     at.run()
     assert env["searches"] == 1
     assert trade_column(at) == default_trades
+
+
+def test_budget_for_new_positions_defaults_to_15_and_is_part_of_the_result_key(env):
+    at = launch()
+    assert at.number_input(key="ap_budget").value == 15.0
+    at.radio(key="ap_sizing").set_value("Risk parity")
+    at = run_search(at)
+    assert env["searches"] == 1
+    targets = at.dataframe[2].value["Target"].str.rstrip("%").astype(float)
+    assert targets.iloc[len(HELD):].sum() == pytest.approx(15.0, abs=0.05)
+    at.number_input(key="ap_budget").set_value(30.0)
+    at.run()
+    assert any("Press Run search" in i.value for i in at.info)
 
 
 def test_inputs_and_result_survive_a_visit_to_the_other_page(env):

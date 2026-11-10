@@ -21,11 +21,12 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 # Widget keys. Streamlit drops a widget's state while another page is showing, so these are copied aside and restored.
 K_SOURCE, K_WATCH, K_MAX_NEW, K_MODE = "ap_source", "ap_watchlist", "ap_max_new", "ap_mode"
-K_SIZING, K_CAP, K_TILT = "ap_sizing", "ap_cap", "ap_tilt"
+K_SIZING, K_CAP, K_TILT, K_BUDGET = "ap_sizing", "ap_cap", "ap_tilt", "ap_budget"
 K_BAND_ABS, K_BAND_REL, K_FINALIST = "ap_band_abs", "ap_band_rel", "ap_finalist"
 DEFAULTS = {
     K_SOURCE: SOURCES[0], K_WATCH: [], K_MAX_NEW: 3, K_MODE: "Reweight everything",
     K_SIZING: next(iter(SIZING_LABELS)), K_CAP: False, K_TILT: int(search.DEFAULT_TILT * 100),
+    K_BUDGET: search.DEFAULT_NEW_BUDGET * 100,
     K_BAND_ABS: search.BAND_ABSOLUTE * 100, K_BAND_REL: search.BAND_RELATIVE * 100, K_FINALIST: None,
 }
 HOLDINGS_KEY, RESULTS_KEY = "ap_holdings", "ap_results"
@@ -142,9 +143,12 @@ def keep_inputs() -> None:
             st.session_state[f"kept_{key}"] = st.session_state[key]
 
 
-def search_key(holdings: pd.Series, candidates: tuple, max_new: int, mode: str, sizing: str, cap: bool, tilt: int) -> tuple:
+def search_key(
+    holdings: pd.Series, candidates: tuple, max_new: int, mode: str, sizing: str, cap: bool, tilt: int,
+    budget: float = 100.0,
+) -> tuple:
     held = tuple(sorted((t, round(float(w), 6)) for t, w in holdings.items() if w > 0))
-    return held, candidates, max_new, mode, sizing, cap, tilt
+    return held, candidates, max_new, mode, sizing, cap, tilt, round(float(budget), 6)
 
 
 def remember(key: tuple, stored: Stored) -> None:
@@ -201,7 +205,7 @@ def candidate_inputs(uni: pd.DataFrame) -> tuple:
 
 def run_search(
     held_pct: pd.Series, candidates: tuple, max_new: int, mode_label: str, sizing_label: str, cap: bool, tilt: int,
-    key: tuple,
+    budget: float, key: tuple,
 ) -> None:
     mode, sizing = MODE_LABELS[mode_label], SIZING_LABELS[sizing_label]
     bar = st.progress(0.0, text="Loading prices…")
@@ -220,7 +224,8 @@ def run_search(
             tickers = list(candidates[1])
         returns, failures = search.load_history(list(held_pct.index), tickers, progress=on_load)
         result = search.search(
-            returns, held_pct, tickers, max_new=max_new, mode=mode, sizing=sizing, cap_positions=cap, tilt=tilt / 100, unavailable=failures, progress=on_depth,
+            returns, held_pct, tickers, max_new=max_new, mode=mode, sizing=sizing, cap_positions=cap,
+            tilt=tilt / 100, new_budget=budget / 100, unavailable=failures, progress=on_depth,
         )
     except Exception as exc:
         bar.empty()
@@ -283,7 +288,7 @@ def page() -> None:
     st.set_page_config(page_title="Add positions", layout="wide")
     st.title("Add positions")
     st.write(
-        "Finds up to five stocks to add to your portfolio so that, at risk parity, it is as diversified as possible."
+        f"Finds up to {search.MAX_NEW_LIMIT} stocks to add to your portfolio so that, at risk parity, it is as diversified as possible."
     )
     restore_inputs()
     uni, uni_warning = ui.cached_universe()
@@ -315,6 +320,12 @@ def page() -> None:
         help="Balanced sizing: 0 is pure risk parity, 100 is pure max Sharpe. Max Sharpe uses shrunk historical "
         "returns, so it favours what did best over the window.",
     )
+    budget = st.number_input(
+        "New positions in total: at most (% of the portfolio)", min_value=1.0, max_value=100.0, step=1.0, key=K_BUDGET,
+        help="The additions together never take more than this. Without a limit, risk parity gives each addition "
+        "the same risk as your whole current portfolio (keep mode) or as any single holding (reweight mode), and "
+        "low-volatility additions then take most of the weight. 100 switches the limit off.",
+    )
     left, right = st.columns(2)
     absolute = left.number_input(
         "Band: absolute (points)", min_value=0.0, max_value=100.0, step=0.5, key=K_BAND_ABS,
@@ -327,9 +338,9 @@ def page() -> None:
     keep_inputs()
 
     ready = held_pct is not None and not held_pct.empty and (candidates[0] == "sp500" or bool(candidates[1]))
-    key = search_key(held_pct, candidates, max_new, MODE_LABELS[mode_label], SIZING_LABELS[sizing_label], cap, tilt) if ready else None
+    key = search_key(held_pct, candidates, max_new, MODE_LABELS[mode_label], SIZING_LABELS[sizing_label], cap, tilt, budget) if ready else None
     if st.button("Run search", type="primary", disabled=not ready):
-        run_search(held_pct, candidates, max_new, mode_label, sizing_label, cap, tilt, key)
+        run_search(held_pct, candidates, max_new, mode_label, sizing_label, cap, tilt, budget, key)
     if not ready:
         st.info("Upload a portfolio and choose candidates to begin.")
     else:
